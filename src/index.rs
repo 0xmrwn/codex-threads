@@ -169,6 +169,58 @@ pub fn list_projects(
     Ok((items, auto_sync))
 }
 
+pub fn list_threads(
+    paths: &ResolvedPaths,
+    limit: usize,
+    project: Option<&str>,
+    ascending: bool,
+) -> Result<(Vec<ThreadRecord>, bool), AppError> {
+    let auto_sync = ensure_fresh(paths)?;
+    let conn = open_connection(paths, false)?;
+    let resolved_project = resolve_project_filter(&conn, project)?;
+    let direction = if ascending { "ASC" } else { "DESC" };
+    let sql = if resolved_project.is_some() {
+        format!(
+            "SELECT thread_id, project_slug, project_cwd, title, updated_at, started_at,
+                    source_kind, cwd, cli_version, has_subagents, message_count, event_count,
+                    archived, default_scope, path
+             FROM threads
+             WHERE default_scope = 1 AND project_slug = ?2
+             ORDER BY CASE WHEN COALESCE(started_at, updated_at) IS NULL THEN 1 ELSE 0 END ASC,
+                      COALESCE(started_at, updated_at, '') {direction},
+                      thread_id ASC
+             LIMIT ?1"
+        )
+    } else {
+        format!(
+            "SELECT thread_id, project_slug, project_cwd, title, updated_at, started_at,
+                    source_kind, cwd, cli_version, has_subagents, message_count, event_count,
+                    archived, default_scope, path
+             FROM threads
+             WHERE default_scope = 1
+             ORDER BY CASE WHEN COALESCE(started_at, updated_at) IS NULL THEN 1 ELSE 0 END ASC,
+                      COALESCE(started_at, updated_at, '') {direction},
+                      thread_id ASC
+             LIMIT ?1"
+        )
+    };
+
+    let items = if let Some(slug) = resolved_project {
+        let mut stmt = conn.prepare(&sql).map_err(sqlite_err)?;
+        let rows = stmt
+            .query_map(params![limit as i64, slug], thread_record_row)
+            .map_err(sqlite_err)?;
+        rows.collect::<Result<Vec<_>, _>>().map_err(sqlite_err)?
+    } else {
+        let mut stmt = conn.prepare(&sql).map_err(sqlite_err)?;
+        let rows = stmt
+            .query_map(params![limit as i64], thread_record_row)
+            .map_err(sqlite_err)?;
+        rows.collect::<Result<Vec<_>, _>>().map_err(sqlite_err)?
+    };
+    Ok((items, auto_sync))
+}
+
 pub fn search_threads(
     paths: &ResolvedPaths,
     query: &str,
@@ -336,6 +388,73 @@ pub fn search_messages(
     Ok((hits, auto_sync))
 }
 
+pub fn list_messages(
+    paths: &ResolvedPaths,
+    limit: usize,
+    project: Option<&str>,
+    role: Option<String>,
+    ascending: bool,
+) -> Result<(Vec<MessageRecord>, bool), AppError> {
+    let auto_sync = ensure_fresh(paths)?;
+    let conn = open_connection(paths, false)?;
+    let resolved_project = resolve_project_filter(&conn, project)?;
+    let direction = if ascending { "ASC" } else { "DESC" };
+    let mut sql = format!(
+        "SELECT m.message_id, m.thread_id, t.project_slug, m.turn_id, m.role, m.kind,
+                m.timestamp, m.text, m.snippet
+         FROM messages m
+         JOIN threads t ON t.thread_id = m.thread_id
+         WHERE t.default_scope = 1"
+    );
+    let mut next_param = 2;
+    if resolved_project.is_some() {
+        sql.push_str(&format!(" AND t.project_slug = ?{next_param}"));
+        next_param += 1;
+    }
+    if role.is_some() {
+        sql.push_str(&format!(" AND m.role = ?{next_param}"));
+    }
+    sql.push_str(&format!(
+        " ORDER BY CASE WHEN m.timestamp IS NULL THEN 1 ELSE 0 END ASC,
+                  COALESCE(m.timestamp, '') {direction},
+                  m.thread_id ASC,
+                  m.ordinal ASC
+          LIMIT ?1"
+    ));
+
+    let items = match (resolved_project.as_deref(), role.as_deref()) {
+        (Some(slug), Some(role)) => {
+            let mut stmt = conn.prepare(&sql).map_err(sqlite_err)?;
+            let rows = stmt
+                .query_map(params![limit as i64, slug, role], message_record_row)
+                .map_err(sqlite_err)?;
+            rows.collect::<Result<Vec<_>, _>>().map_err(sqlite_err)?
+        }
+        (Some(slug), None) => {
+            let mut stmt = conn.prepare(&sql).map_err(sqlite_err)?;
+            let rows = stmt
+                .query_map(params![limit as i64, slug], message_record_row)
+                .map_err(sqlite_err)?;
+            rows.collect::<Result<Vec<_>, _>>().map_err(sqlite_err)?
+        }
+        (None, Some(role)) => {
+            let mut stmt = conn.prepare(&sql).map_err(sqlite_err)?;
+            let rows = stmt
+                .query_map(params![limit as i64, role], message_record_row)
+                .map_err(sqlite_err)?;
+            rows.collect::<Result<Vec<_>, _>>().map_err(sqlite_err)?
+        }
+        (None, None) => {
+            let mut stmt = conn.prepare(&sql).map_err(sqlite_err)?;
+            let rows = stmt
+                .query_map(params![limit as i64], message_record_row)
+                .map_err(sqlite_err)?;
+            rows.collect::<Result<Vec<_>, _>>().map_err(sqlite_err)?
+        }
+    };
+    Ok((items, auto_sync))
+}
+
 pub fn read_message(
     paths: &ResolvedPaths,
     message_id: &str,
@@ -352,19 +471,7 @@ pub fn read_message(
         )
         .map_err(sqlite_err)?;
     let record = stmt
-        .query_row([message_id], |row| {
-            Ok(MessageRecord {
-                message_id: row.get(0)?,
-                thread_id: row.get(1)?,
-                project_slug: row.get(2)?,
-                turn_id: row.get(3)?,
-                role: row.get(4)?,
-                kind: row.get(5)?,
-                timestamp: row.get(6)?,
-                text: row.get(7)?,
-                snippet: row.get(8)?,
-            })
-        })
+        .query_row([message_id], message_record_row)
         .optional()
         .map_err(sqlite_err)?
         .ok_or_else(|| {
@@ -1065,6 +1172,40 @@ fn thread_search_hit_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<ThreadSear
     })
 }
 
+fn thread_record_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<ThreadRecord> {
+    Ok(ThreadRecord {
+        thread_id: row.get(0)?,
+        project_slug: row.get(1)?,
+        project_cwd: row.get(2)?,
+        title: row.get(3)?,
+        updated_at: row.get(4)?,
+        started_at: row.get(5)?,
+        source_kind: row.get(6)?,
+        cwd: row.get(7)?,
+        cli_version: row.get(8)?,
+        has_subagents: row.get::<_, i64>(9)? != 0,
+        message_count: row.get(10)?,
+        event_count: row.get(11)?,
+        archived: row.get::<_, i64>(12)? != 0,
+        default_scope: row.get::<_, i64>(13)? != 0,
+        path: row.get(14)?,
+    })
+}
+
+fn message_record_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<MessageRecord> {
+    Ok(MessageRecord {
+        message_id: row.get(0)?,
+        thread_id: row.get(1)?,
+        project_slug: row.get(2)?,
+        turn_id: row.get(3)?,
+        role: row.get(4)?,
+        kind: row.get(5)?,
+        timestamp: row.get(6)?,
+        text: row.get(7)?,
+        snippet: row.get(8)?,
+    })
+}
+
 fn read_thread_from_conn(
     conn: &Connection,
     thread_id: &str,
@@ -1077,27 +1218,9 @@ fn read_thread_from_conn(
              FROM threads WHERE thread_id = ?1",
         )
         .map_err(sqlite_err)?;
-    stmt.query_row([thread_id], |row| {
-        Ok(ThreadRecord {
-            thread_id: row.get(0)?,
-            project_slug: row.get(1)?,
-            project_cwd: row.get(2)?,
-            title: row.get(3)?,
-            updated_at: row.get(4)?,
-            started_at: row.get(5)?,
-            source_kind: row.get(6)?,
-            cwd: row.get(7)?,
-            cli_version: row.get(8)?,
-            has_subagents: row.get::<_, i64>(9)? != 0,
-            message_count: row.get(10)?,
-            event_count: row.get(11)?,
-            archived: row.get::<_, i64>(12)? != 0,
-            default_scope: row.get::<_, i64>(13)? != 0,
-            path: row.get(14)?,
-        })
-    })
-    .optional()
-    .map_err(sqlite_err)
+    stmt.query_row([thread_id], thread_record_row)
+        .optional()
+        .map_err(sqlite_err)
 }
 
 fn resolve_project_filter(
