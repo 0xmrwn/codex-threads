@@ -1,0 +1,8 @@
+{"timestamp":"2026-04-11T12:00:00Z","type":"session_meta","payload":{"id":"33333333-3333-4333-8333-333333333333","timestamp":"2026-04-11T12:00:00Z","cwd":"/workspace/codex-threads","cli_version":"0.120.0","source":{"subagent":"review"}}}
+{"timestamp":"2026-04-11T12:00:01Z","type":"session_meta","payload":{"id":"99999999-9999-4999-8999-999999999999","timestamp":"2026-04-11T11:59:59Z","cwd":"/workspace/codex-threads","cli_version":"0.120.0","source":"cli"}}
+{"timestamp":"2026-04-11T12:00:02Z","type":"turn_context","payload":{"turn_id":"parent-turn","cwd":"/workspace/codex-threads","model":"gpt-5.4","summary":"parent task"}}
+{"timestamp":"2026-04-11T12:00:03Z","type":"event_msg","payload":{"type":"user_message","turn_id":"parent-turn","message":"parent-only message that must not leak into subagent reads","images":[],"local_images":[],"text_elements":[]}}
+{"timestamp":"2026-04-11T12:00:04Z","type":"response_item","payload":{"type":"message","role":"assistant","content":[{"type":"output_text","text":"Parent response that must not leak into subagent reads."}]}}
+{"timestamp":"2026-04-11T12:00:05Z","type":"turn_context","payload":{"turn_id":"turn-3","cwd":"/workspace/codex-threads","model":"gpt-5.4","summary":"subagent review"}}
+{"timestamp":"2026-04-11T12:00:06Z","type":"event_msg","payload":{"type":"user_message","turn_id":"turn-3","message":"build a CLI review","images":[],"local_images":[],"text_elements":[]}}
+{"timestamp":"2026-04-11T12:00:07Z","type":"response_item","payload":{"type":"message","role":"assistant","content":[{"type":"output_text","text":"Reviewing CLI search behavior."}]}}

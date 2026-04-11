@@ -1,0 +1,3 @@
+{"timestamp":"2026-04-10T08:00:00Z","type":"session_meta","payload":{"id":"44444444-4444-4444-8444-444444444444","timestamp":"2026-04-10T08:00:00Z","cwd":"/workspace/archive","cli_version":"0.119.0","source":"cli"}}
+{"timestamp":"2026-04-10T08:00:01Z","type":"event_msg","payload":{"type":"user_message","turn_id":"turn-4","message":"tweet idea from archived session","images":[],"local_images":[],"text_elements":[]}}
+{"timestamp":"2026-04-10T08:00:02Z","type":"response_item","payload":{"type":"message","role":"assistant","content":[{"type":"output_text","text":"Archived tweet idea for the project."}]}}
