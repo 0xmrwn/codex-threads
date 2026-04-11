@@ -34,6 +34,8 @@ pub struct ArchiveInventory {
 #[derive(Debug, Clone)]
 pub struct IndexedThread {
     pub thread_id: String,
+    pub project_slug: Option<String>,
+    pub project_cwd: Option<String>,
     pub path: Utf8PathBuf,
     pub archived: bool,
     pub default_scope: bool,
@@ -134,7 +136,9 @@ pub fn parse_thread(
     let mut tail_events = Vec::new();
 
     let mut started_at: Option<String> = None;
-    let mut cwd: Option<String> = None;
+    let mut session_cwd: Option<String> = None;
+    let mut first_turn_context_cwd: Option<String> = None;
+    let mut tail_turn_context_cwd: Option<String> = None;
     let mut cli_version: Option<String> = None;
     let mut source_kind = "unknown".to_string();
     let mut default_scope = true;
@@ -203,8 +207,8 @@ pub fn parse_thread(
                         .and_then(Value::as_str)
                         .map(ToOwned::to_owned);
                 }
-                if cwd.is_none() {
-                    cwd = payload
+                if session_cwd.is_none() {
+                    session_cwd = payload
                         .and_then(|item| item.get("cwd"))
                         .and_then(Value::as_str)
                         .map(ToOwned::to_owned);
@@ -248,6 +252,20 @@ pub fn parse_thread(
             tail_block_started = true;
             tail_messages.clear();
             tail_events.clear();
+            tail_turn_context_cwd = None;
+        }
+
+        if record_type == "turn_context" {
+            let turn_context_cwd = payload
+                .and_then(|item| item.get("cwd"))
+                .and_then(Value::as_str)
+                .map(ToOwned::to_owned);
+            if first_turn_context_cwd.is_none() {
+                first_turn_context_cwd = turn_context_cwd.clone();
+            }
+            if tail_block_started && tail_turn_context_cwd.is_none() {
+                tail_turn_context_cwd = turn_context_cwd;
+            }
         }
 
         if let Some(message) = extract_message(
@@ -306,10 +324,20 @@ pub fn parse_thread(
         .and_then(|item| item.updated_at.clone())
         .or_else(|| started_at.clone());
     let search_text = build_thread_search_text(title.as_deref(), &messages);
+    let project_cwd = if use_tail_scope {
+        session_cwd.or(tail_turn_context_cwd)
+    } else {
+        session_cwd.or(first_turn_context_cwd)
+    }
+    .map(|cwd| normalize_project_cwd(&cwd));
+    let project_slug = project_cwd.as_deref().map(project_slug_from_cwd);
+    let cwd = project_cwd.clone();
 
     Ok(ParsedThread {
         thread: IndexedThread {
             thread_id: file.thread_id.clone(),
+            project_slug,
+            project_cwd,
             path: file.path.clone(),
             archived: file.archived,
             default_scope,
@@ -457,6 +485,47 @@ fn classify_source(value: &Value) -> (String, bool) {
         return ("subagent".to_string(), false);
     }
     ("object".to_string(), false)
+}
+
+fn normalize_project_cwd(raw: &str) -> String {
+    let mut normalized = raw.to_string();
+    while normalized.len() > 1
+        && (normalized.ends_with('/') || normalized.ends_with('\\'))
+        && !is_windows_drive_root(&normalized)
+    {
+        normalized.pop();
+    }
+    normalized
+}
+
+fn is_windows_drive_root(value: &str) -> bool {
+    let bytes = value.as_bytes();
+    bytes.len() == 3
+        && bytes[1] == b':'
+        && bytes[0].is_ascii_alphabetic()
+        && (bytes[2] == b'/' || bytes[2] == b'\\')
+}
+
+fn project_slug_from_cwd(cwd: &str) -> String {
+    let mut slug = String::with_capacity(cwd.len());
+    for byte in cwd.bytes() {
+        if byte.is_ascii_alphanumeric() {
+            slug.push(byte as char);
+            continue;
+        }
+        slug.push('~');
+        slug.push(hex_digit(byte >> 4));
+        slug.push(hex_digit(byte & 0x0f));
+    }
+    slug
+}
+
+fn hex_digit(value: u8) -> char {
+    match value {
+        0..=9 => (b'0' + value) as char,
+        10..=15 => (b'A' + (value - 10)) as char,
+        _ => unreachable!("nibble out of range"),
+    }
 }
 
 fn extract_message(

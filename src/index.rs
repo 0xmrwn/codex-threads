@@ -11,11 +11,14 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::fs::File;
 use std::io::{Read, Seek, SeekFrom};
 
+const SCHEMA_VERSION: &str = "2";
+
 #[derive(Debug, Serialize)]
 pub struct SyncSummary {
     pub discovered_files: usize,
     pub updated_files: usize,
     pub removed_files: usize,
+    pub project_count: usize,
     pub thread_count: usize,
     pub message_count: usize,
     pub event_count: usize,
@@ -25,6 +28,8 @@ pub struct SyncSummary {
 #[derive(Debug, Serialize)]
 pub struct ThreadRecord {
     pub thread_id: String,
+    pub project_slug: Option<String>,
+    pub project_cwd: Option<String>,
     pub title: Option<String>,
     pub updated_at: Option<String>,
     pub started_at: Option<String>,
@@ -42,6 +47,7 @@ pub struct ThreadRecord {
 #[derive(Debug, Serialize)]
 pub struct ThreadSearchHit {
     pub thread_id: String,
+    pub project_slug: Option<String>,
     pub title: Option<String>,
     pub updated_at: Option<String>,
     pub started_at: Option<String>,
@@ -54,6 +60,7 @@ pub struct ThreadSearchHit {
 pub struct MessageRecord {
     pub message_id: String,
     pub thread_id: String,
+    pub project_slug: Option<String>,
     pub turn_id: Option<String>,
     pub role: String,
     pub kind: String,
@@ -66,6 +73,7 @@ pub struct MessageRecord {
 pub struct MessageSearchHit {
     pub message_id: String,
     pub thread_id: String,
+    pub project_slug: Option<String>,
     pub role: String,
     pub kind: String,
     pub timestamp: Option<String>,
@@ -84,10 +92,19 @@ pub struct EventRecord {
 }
 
 #[derive(Debug, Serialize)]
+pub struct ProjectRecord {
+    pub project_slug: String,
+    pub project_cwd: Option<String>,
+    pub thread_count: i64,
+    pub last_seen_at: Option<String>,
+}
+
+#[derive(Debug, Serialize)]
 pub struct StatsRecord {
     pub index_path: String,
     pub last_sync_at: Option<String>,
     pub source_file_count: i64,
+    pub project_count: i64,
     pub thread_count: i64,
     pub message_count: i64,
     pub event_count: i64,
@@ -105,15 +122,17 @@ struct FileState {
 
 pub fn sync(paths: &ResolvedPaths, rebuild: bool) -> Result<SyncSummary, AppError> {
     let inventory = discover_archives(paths)?;
+    let rebuild = rebuild || schema_requires_rebuild(paths)?;
     sync_with_inventory(paths, inventory, rebuild)
 }
 
 pub fn ensure_fresh(paths: &ResolvedPaths) -> Result<bool, AppError> {
     let inventory = discover_archives(paths)?;
-    if needs_sync(paths, &inventory)? {
-        match sync_with_inventory(paths, inventory, false) {
+    let rebuild = schema_requires_rebuild(paths)?;
+    if rebuild || needs_sync(paths, &inventory)? {
+        match sync_with_inventory(paths, inventory, rebuild) {
             Ok(_) => return Ok(true),
-            Err(error) if error.is_sqlite_locked() && paths.index_path.exists() => {
+            Err(error) if !rebuild && error.is_sqlite_locked() && paths.index_path.exists() => {
                 return Ok(false);
             }
             Err(error) => return Err(error),
@@ -122,39 +141,73 @@ pub fn ensure_fresh(paths: &ResolvedPaths) -> Result<bool, AppError> {
     Ok(false)
 }
 
+pub fn list_projects(
+    paths: &ResolvedPaths,
+    limit: usize,
+) -> Result<(Vec<ProjectRecord>, bool), AppError> {
+    let auto_sync = ensure_fresh(paths)?;
+    let conn = open_connection(paths, false)?;
+    let mut stmt = conn
+        .prepare(
+            "SELECT project_slug, project_cwd, thread_count, last_seen_at
+             FROM projects
+             ORDER BY COALESCE(last_seen_at, '') DESC, project_slug
+             LIMIT ?1",
+        )
+        .map_err(sqlite_err)?;
+    let rows = stmt
+        .query_map(params![limit as i64], |row| {
+            Ok(ProjectRecord {
+                project_slug: row.get(0)?,
+                project_cwd: row.get(1)?,
+                thread_count: row.get(2)?,
+                last_seen_at: row.get(3)?,
+            })
+        })
+        .map_err(sqlite_err)?;
+    let items = rows.collect::<Result<Vec<_>, _>>().map_err(sqlite_err)?;
+    Ok((items, auto_sync))
+}
+
 pub fn search_threads(
     paths: &ResolvedPaths,
     query: &str,
     limit: usize,
+    project: Option<&str>,
 ) -> Result<(Vec<ThreadSearchHit>, bool), AppError> {
     let auto_sync = ensure_fresh(paths)?;
     let conn = open_connection(paths, false)?;
+    let resolved_project = resolve_project_filter(&conn, project)?;
     let query = fts_query(query);
-    let mut stmt = conn
-        .prepare(
-            "SELECT t.thread_id, t.title, t.updated_at, t.started_at, t.source_kind, t.cwd,
-                    snippet(thread_fts, 1, '', '', ' ... ', 14) AS snippet
-             FROM thread_fts
-             JOIN threads t USING(thread_id)
-             WHERE thread_fts MATCH ?1 AND t.default_scope = 1
-             ORDER BY bm25(thread_fts), COALESCE(t.updated_at, '') DESC, t.thread_id
-             LIMIT ?2",
-        )
-        .map_err(sqlite_err)?;
-    let rows = stmt
-        .query_map(params![query, limit as i64], |row| {
-            Ok(ThreadSearchHit {
-                thread_id: row.get(0)?,
-                title: row.get(1)?,
-                updated_at: row.get(2)?,
-                started_at: row.get(3)?,
-                source_kind: row.get(4)?,
-                cwd: row.get(5)?,
-                snippet: row.get(6)?,
-            })
-        })
-        .map_err(sqlite_err)?;
-    let hits = rows.collect::<Result<Vec<_>, _>>().map_err(sqlite_err)?;
+    let mut sql = String::from(
+        "SELECT t.thread_id, t.project_slug, t.title, t.updated_at, t.started_at,
+                t.source_kind, t.cwd,
+                snippet(thread_fts, 1, '', '', ' ... ', 14) AS snippet
+         FROM thread_fts
+         JOIN threads t USING(thread_id)
+         WHERE thread_fts MATCH ?1 AND t.default_scope = 1",
+    );
+    if resolved_project.is_some() {
+        sql.push_str(" AND t.project_slug = ?3");
+    }
+    sql.push_str(
+        " ORDER BY bm25(thread_fts), COALESCE(t.updated_at, '') DESC, t.thread_id
+          LIMIT ?2",
+    );
+
+    let hits = if let Some(slug) = resolved_project {
+        let mut stmt = conn.prepare(&sql).map_err(sqlite_err)?;
+        let rows = stmt
+            .query_map(params![query, limit as i64, slug], thread_search_hit_row)
+            .map_err(sqlite_err)?;
+        rows.collect::<Result<Vec<_>, _>>().map_err(sqlite_err)?
+    } else {
+        let mut stmt = conn.prepare(&sql).map_err(sqlite_err)?;
+        let rows = stmt
+            .query_map(params![query, limit as i64], thread_search_hit_row)
+            .map_err(sqlite_err)?;
+        rows.collect::<Result<Vec<_>, _>>().map_err(sqlite_err)?
+    };
     Ok((hits, auto_sync))
 }
 
@@ -225,35 +278,61 @@ pub fn search_messages(
     paths: &ResolvedPaths,
     query: &str,
     limit: usize,
+    project: Option<&str>,
 ) -> Result<(Vec<MessageSearchHit>, bool), AppError> {
     let auto_sync = ensure_fresh(paths)?;
     let conn = open_connection(paths, false)?;
+    let resolved_project = resolve_project_filter(&conn, project)?;
     let query = fts_query(query);
-    let mut stmt = conn
-        .prepare(
-            "SELECT m.message_id, m.thread_id, m.role, m.kind, m.timestamp,
-                    snippet(message_fts, 2, '', '', ' ... ', 18) AS snippet
-             FROM message_fts
-             JOIN messages m USING(message_id)
-             JOIN threads t ON t.thread_id = m.thread_id
-             WHERE message_fts MATCH ?1 AND t.default_scope = 1
-             ORDER BY bm25(message_fts), COALESCE(m.timestamp, '') DESC, m.message_id
-             LIMIT ?2",
-        )
-        .map_err(sqlite_err)?;
-    let rows = stmt
-        .query_map(params![query, limit as i64], |row| {
-            Ok(MessageSearchHit {
-                message_id: row.get(0)?,
-                thread_id: row.get(1)?,
-                role: row.get(2)?,
-                kind: row.get(3)?,
-                timestamp: row.get(4)?,
-                snippet: row.get(5)?,
+    let mut sql = String::from(
+        "SELECT m.message_id, m.thread_id, t.project_slug, m.role, m.kind, m.timestamp,
+                snippet(message_fts, 2, '', '', ' ... ', 18) AS snippet
+         FROM message_fts
+         JOIN messages m USING(message_id)
+         JOIN threads t ON t.thread_id = m.thread_id
+         WHERE message_fts MATCH ?1 AND t.default_scope = 1",
+    );
+    if resolved_project.is_some() {
+        sql.push_str(" AND t.project_slug = ?3");
+    }
+    sql.push_str(
+        " ORDER BY bm25(message_fts), COALESCE(m.timestamp, '') DESC, m.message_id
+          LIMIT ?2",
+    );
+
+    let hits = if let Some(slug) = resolved_project {
+        let mut stmt = conn.prepare(&sql).map_err(sqlite_err)?;
+        let rows = stmt
+            .query_map(params![query, limit as i64, slug], |row| {
+                Ok(MessageSearchHit {
+                    message_id: row.get(0)?,
+                    thread_id: row.get(1)?,
+                    project_slug: row.get(2)?,
+                    role: row.get(3)?,
+                    kind: row.get(4)?,
+                    timestamp: row.get(5)?,
+                    snippet: row.get(6)?,
+                })
             })
-        })
-        .map_err(sqlite_err)?;
-    let hits = rows.collect::<Result<Vec<_>, _>>().map_err(sqlite_err)?;
+            .map_err(sqlite_err)?;
+        rows.collect::<Result<Vec<_>, _>>().map_err(sqlite_err)?
+    } else {
+        let mut stmt = conn.prepare(&sql).map_err(sqlite_err)?;
+        let rows = stmt
+            .query_map(params![query, limit as i64], |row| {
+                Ok(MessageSearchHit {
+                    message_id: row.get(0)?,
+                    thread_id: row.get(1)?,
+                    project_slug: row.get(2)?,
+                    role: row.get(3)?,
+                    kind: row.get(4)?,
+                    timestamp: row.get(5)?,
+                    snippet: row.get(6)?,
+                })
+            })
+            .map_err(sqlite_err)?;
+        rows.collect::<Result<Vec<_>, _>>().map_err(sqlite_err)?
+    };
     Ok((hits, auto_sync))
 }
 
@@ -265,9 +344,11 @@ pub fn read_message(
     let conn = open_connection(paths, false)?;
     let mut stmt = conn
         .prepare(
-            "SELECT message_id, thread_id, turn_id, role, kind, timestamp, text, snippet
-             FROM messages
-             WHERE message_id = ?1",
+            "SELECT m.message_id, m.thread_id, t.project_slug, m.turn_id, m.role, m.kind,
+                    m.timestamp, m.text, m.snippet
+             FROM messages m
+             JOIN threads t ON t.thread_id = m.thread_id
+             WHERE m.message_id = ?1",
         )
         .map_err(sqlite_err)?;
     let record = stmt
@@ -275,12 +356,13 @@ pub fn read_message(
             Ok(MessageRecord {
                 message_id: row.get(0)?,
                 thread_id: row.get(1)?,
-                turn_id: row.get(2)?,
-                role: row.get(3)?,
-                kind: row.get(4)?,
-                timestamp: row.get(5)?,
-                text: row.get(6)?,
-                snippet: row.get(7)?,
+                project_slug: row.get(2)?,
+                turn_id: row.get(3)?,
+                role: row.get(4)?,
+                kind: row.get(5)?,
+                timestamp: row.get(6)?,
+                text: row.get(7)?,
+                snippet: row.get(8)?,
             })
         })
         .optional()
@@ -368,6 +450,9 @@ pub fn stats(paths: &ResolvedPaths) -> Result<(StatsRecord, bool), AppError> {
     let source_file_count: i64 = conn
         .query_row("SELECT COUNT(*) FROM files", [], |row| row.get(0))
         .map_err(sqlite_err)?;
+    let project_count: i64 = conn
+        .query_row("SELECT COUNT(*) FROM projects", [], |row| row.get(0))
+        .map_err(sqlite_err)?;
     let thread_count: i64 = conn
         .query_row("SELECT COUNT(*) FROM threads", [], |row| row.get(0))
         .map_err(sqlite_err)?;
@@ -383,6 +468,7 @@ pub fn stats(paths: &ResolvedPaths) -> Result<(StatsRecord, bool), AppError> {
             index_path: paths.index_path.to_string(),
             last_sync_at,
             source_file_count,
+            project_count,
             thread_count,
             message_count,
             event_count,
@@ -446,10 +532,10 @@ fn sync_with_inventory(
 ) -> Result<SyncSummary, AppError> {
     paths.ensure_index_dir()?;
     let mut conn = open_connection(paths, true)?;
-    init_schema(&conn)?;
     if rebuild {
-        clear_all(&conn)?;
+        reset_schema(&conn)?;
     }
+    init_schema(&conn)?;
 
     let existing = load_file_state(&conn)?;
     let current_paths = inventory
@@ -488,9 +574,13 @@ fn sync_with_inventory(
         insert_parsed_thread(&transaction, item, &parsed)?;
     }
     apply_title_updates(&transaction, &inventory.titles)?;
+    refresh_projects(&transaction)?;
     update_state(&transaction, &inventory)?;
     transaction.commit().map_err(sqlite_err)?;
 
+    let project_count = conn
+        .query_row("SELECT COUNT(*) FROM projects", [], |row| row.get(0))
+        .map_err(sqlite_err)?;
     let thread_count = conn
         .query_row("SELECT COUNT(*) FROM threads", [], |row| row.get(0))
         .map_err(sqlite_err)?;
@@ -505,11 +595,44 @@ fn sync_with_inventory(
         discovered_files: inventory.files.len(),
         updated_files: updated.len(),
         removed_files: removed.len(),
+        project_count,
         thread_count,
         message_count,
         event_count,
         rebuilt: rebuild,
     })
+}
+
+fn schema_requires_rebuild(paths: &ResolvedPaths) -> Result<bool, AppError> {
+    if !paths.index_path.exists() {
+        return Ok(false);
+    }
+    let conn = open_connection(paths, false)?;
+    index_schema_mismatch(&conn)
+}
+
+fn index_schema_mismatch(conn: &Connection) -> Result<bool, AppError> {
+    let has_state: bool = conn
+        .query_row(
+            "SELECT EXISTS(
+                SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'state'
+             )",
+            [],
+            |row| row.get(0),
+        )
+        .map_err(sqlite_err)?;
+    if !has_state {
+        return Ok(true);
+    }
+    let schema_version: Option<String> = conn
+        .query_row(
+            "SELECT value FROM state WHERE key = 'schema_version'",
+            [],
+            |row| row.get(0),
+        )
+        .optional()
+        .map_err(sqlite_err)?;
+    Ok(schema_version.as_deref() != Some(SCHEMA_VERSION))
 }
 
 fn open_connection(paths: &ResolvedPaths, create_dirs: bool) -> Result<Connection, AppError> {
@@ -538,8 +661,16 @@ fn init_schema(conn: &Connection) -> Result<(), AppError> {
             size INTEGER NOT NULL,
             mtime_ns INTEGER NOT NULL
         );
+        CREATE TABLE IF NOT EXISTS projects (
+            project_slug TEXT PRIMARY KEY,
+            project_cwd TEXT,
+            thread_count INTEGER NOT NULL,
+            last_seen_at TEXT
+        );
         CREATE TABLE IF NOT EXISTS threads (
             thread_id TEXT PRIMARY KEY,
+            project_slug TEXT,
+            project_cwd TEXT,
             path TEXT NOT NULL,
             archived INTEGER NOT NULL,
             default_scope INTEGER NOT NULL,
@@ -578,6 +709,7 @@ fn init_schema(conn: &Connection) -> Result<(), AppError> {
         );
         CREATE INDEX IF NOT EXISTS idx_messages_thread_id ON messages(thread_id, ordinal);
         CREATE INDEX IF NOT EXISTS idx_events_thread_id ON events(thread_id, ordinal);
+        CREATE INDEX IF NOT EXISTS idx_threads_project ON threads(project_slug, updated_at DESC);
         CREATE VIRTUAL TABLE IF NOT EXISTS thread_fts USING fts5(
             thread_id UNINDEXED,
             title,
@@ -593,16 +725,17 @@ fn init_schema(conn: &Connection) -> Result<(), AppError> {
     .map_err(sqlite_err)
 }
 
-fn clear_all(conn: &Connection) -> Result<(), AppError> {
+fn reset_schema(conn: &Connection) -> Result<(), AppError> {
     conn.execute_batch(
         "
-        DELETE FROM state;
-        DELETE FROM files;
-        DELETE FROM threads;
-        DELETE FROM messages;
-        DELETE FROM events;
-        DELETE FROM thread_fts;
-        DELETE FROM message_fts;
+        DROP TABLE IF EXISTS state;
+        DROP TABLE IF EXISTS files;
+        DROP TABLE IF EXISTS projects;
+        DROP TABLE IF EXISTS threads;
+        DROP TABLE IF EXISTS messages;
+        DROP TABLE IF EXISTS events;
+        DROP TABLE IF EXISTS thread_fts;
+        DROP TABLE IF EXISTS message_fts;
         ",
     )
     .map_err(sqlite_err)
@@ -682,11 +815,14 @@ fn insert_parsed_thread(
     .map_err(sqlite_err)?;
     tx.execute(
         "INSERT INTO threads(
-            thread_id, path, archived, default_scope, title, updated_at, started_at,
-            source_kind, cwd, cli_version, has_subagents, message_count, event_count, search_text
-         ) VALUES(?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14)",
+            thread_id, project_slug, project_cwd, path, archived, default_scope, title,
+            updated_at, started_at, source_kind, cwd, cli_version, has_subagents,
+            message_count, event_count, search_text
+         ) VALUES(?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16)",
         params![
             thread.thread_id,
+            thread.project_slug,
+            thread.project_cwd,
             thread.path.as_str(),
             bool_to_i64(thread.archived),
             bool_to_i64(thread.default_scope),
@@ -772,6 +908,24 @@ fn insert_events(tx: &Transaction<'_>, events: &[IndexedEvent]) -> Result<(), Ap
     Ok(())
 }
 
+fn refresh_projects(tx: &Transaction<'_>) -> Result<(), AppError> {
+    tx.execute("DELETE FROM projects", []).map_err(sqlite_err)?;
+    tx.execute(
+        "INSERT INTO projects(project_slug, project_cwd, thread_count, last_seen_at)
+         SELECT project_slug,
+                MAX(project_cwd),
+                COUNT(*) FILTER (WHERE default_scope = 1),
+                MAX(updated_at) FILTER (WHERE default_scope = 1)
+         FROM threads
+         WHERE project_slug IS NOT NULL
+         GROUP BY project_slug
+         HAVING COUNT(*) FILTER (WHERE default_scope = 1) > 0",
+        [],
+    )
+    .map_err(sqlite_err)?;
+    Ok(())
+}
+
 fn apply_title_updates(
     tx: &Transaction<'_>,
     titles: &BTreeMap<String, crate::archive::TitleInfo>,
@@ -814,6 +968,12 @@ fn update_state(tx: &Transaction<'_>, inventory: &ArchiveInventory) -> Result<()
             .unwrap_or_default()],
     )
     .map_err(sqlite_err)?;
+    tx.execute(
+        "INSERT INTO state(key, value) VALUES('schema_version', ?1)
+         ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+        [SCHEMA_VERSION],
+    )
+    .map_err(sqlite_err)?;
     Ok(())
 }
 
@@ -839,7 +999,7 @@ fn thread_hits_for_ids(
     let mut hits = Vec::with_capacity(thread_ids.len());
     let mut stmt = conn
         .prepare(
-            "SELECT thread_id, title, updated_at, started_at, source_kind, cwd
+            "SELECT thread_id, project_slug, title, updated_at, started_at, source_kind, cwd
              FROM threads
              WHERE thread_id = ?1",
         )
@@ -847,14 +1007,15 @@ fn thread_hits_for_ids(
     for thread_id in thread_ids {
         let hit = stmt
             .query_row([thread_id], |row| {
-                let title: Option<String> = row.get(1)?;
+                let title: Option<String> = row.get(2)?;
                 Ok(ThreadSearchHit {
                     thread_id: row.get(0)?,
+                    project_slug: row.get(1)?,
                     title: title.clone(),
-                    updated_at: row.get(2)?,
-                    started_at: row.get(3)?,
-                    source_kind: row.get(4)?,
-                    cwd: row.get(5)?,
+                    updated_at: row.get(3)?,
+                    started_at: row.get(4)?,
+                    source_kind: row.get(5)?,
+                    cwd: row.get(6)?,
                     snippet: title.unwrap_or_default(),
                 })
             })
@@ -875,7 +1036,8 @@ fn search_threads_inner(
     let query = fts_query(query);
     let mut stmt = conn
         .prepare(
-            "SELECT t.thread_id, t.title, t.updated_at, t.started_at, t.source_kind, t.cwd,
+            "SELECT t.thread_id, t.project_slug, t.title, t.updated_at, t.started_at,
+                    t.source_kind, t.cwd,
                     snippet(thread_fts, 1, '', '', ' ... ', 14) AS snippet
              FROM thread_fts
              JOIN threads t USING(thread_id)
@@ -885,19 +1047,22 @@ fn search_threads_inner(
         )
         .map_err(sqlite_err)?;
     let rows = stmt
-        .query_map(params![query, limit as i64], |row| {
-            Ok(ThreadSearchHit {
-                thread_id: row.get(0)?,
-                title: row.get(1)?,
-                updated_at: row.get(2)?,
-                started_at: row.get(3)?,
-                source_kind: row.get(4)?,
-                cwd: row.get(5)?,
-                snippet: row.get(6)?,
-            })
-        })
+        .query_map(params![query, limit as i64], thread_search_hit_row)
         .map_err(sqlite_err)?;
     rows.collect::<Result<Vec<_>, _>>().map_err(sqlite_err)
+}
+
+fn thread_search_hit_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<ThreadSearchHit> {
+    Ok(ThreadSearchHit {
+        thread_id: row.get(0)?,
+        project_slug: row.get(1)?,
+        title: row.get(2)?,
+        updated_at: row.get(3)?,
+        started_at: row.get(4)?,
+        source_kind: row.get(5)?,
+        cwd: row.get(6)?,
+        snippet: row.get(7)?,
+    })
 }
 
 fn read_thread_from_conn(
@@ -906,30 +1071,97 @@ fn read_thread_from_conn(
 ) -> Result<Option<ThreadRecord>, AppError> {
     let mut stmt = conn
         .prepare(
-            "SELECT thread_id, title, updated_at, started_at, source_kind, cwd, cli_version,
-                    has_subagents, message_count, event_count, archived, default_scope, path
+            "SELECT thread_id, project_slug, project_cwd, title, updated_at, started_at,
+                    source_kind, cwd, cli_version, has_subagents, message_count, event_count,
+                    archived, default_scope, path
              FROM threads WHERE thread_id = ?1",
         )
         .map_err(sqlite_err)?;
     stmt.query_row([thread_id], |row| {
         Ok(ThreadRecord {
             thread_id: row.get(0)?,
-            title: row.get(1)?,
-            updated_at: row.get(2)?,
-            started_at: row.get(3)?,
-            source_kind: row.get(4)?,
-            cwd: row.get(5)?,
-            cli_version: row.get(6)?,
-            has_subagents: row.get::<_, i64>(7)? != 0,
-            message_count: row.get(8)?,
-            event_count: row.get(9)?,
-            archived: row.get::<_, i64>(10)? != 0,
-            default_scope: row.get::<_, i64>(11)? != 0,
-            path: row.get(12)?,
+            project_slug: row.get(1)?,
+            project_cwd: row.get(2)?,
+            title: row.get(3)?,
+            updated_at: row.get(4)?,
+            started_at: row.get(5)?,
+            source_kind: row.get(6)?,
+            cwd: row.get(7)?,
+            cli_version: row.get(8)?,
+            has_subagents: row.get::<_, i64>(9)? != 0,
+            message_count: row.get(10)?,
+            event_count: row.get(11)?,
+            archived: row.get::<_, i64>(12)? != 0,
+            default_scope: row.get::<_, i64>(13)? != 0,
+            path: row.get(14)?,
         })
     })
     .optional()
     .map_err(sqlite_err)
+}
+
+fn resolve_project_filter(
+    conn: &Connection,
+    project: Option<&str>,
+) -> Result<Option<String>, AppError> {
+    let Some(query) = project else {
+        return Ok(None);
+    };
+    let trimmed = query.trim();
+    if trimmed.is_empty() {
+        return Ok(None);
+    }
+
+    let mut by_slug = conn
+        .prepare("SELECT project_slug FROM projects WHERE project_slug = ?1")
+        .map_err(sqlite_err)?;
+    if let Some(slug) = by_slug
+        .query_row([trimmed], |row| row.get::<_, String>(0))
+        .optional()
+        .map_err(sqlite_err)?
+    {
+        return Ok(Some(slug));
+    }
+
+    let mut by_cwd = conn
+        .prepare("SELECT project_slug FROM projects WHERE project_cwd = ?1")
+        .map_err(sqlite_err)?;
+    if let Some(slug) = by_cwd
+        .query_row([trimmed], |row| row.get::<_, String>(0))
+        .optional()
+        .map_err(sqlite_err)?
+    {
+        return Ok(Some(slug));
+    }
+
+    let mut by_substring = conn
+        .prepare(
+            "SELECT project_slug FROM projects
+             WHERE project_slug LIKE ?1 OR project_cwd LIKE ?1
+             ORDER BY thread_count DESC, project_slug
+             LIMIT 5",
+        )
+        .map_err(sqlite_err)?;
+    let pattern = format!("%{trimmed}%");
+    let rows = by_substring
+        .query_map([pattern], |row| row.get::<_, String>(0))
+        .map_err(sqlite_err)?;
+    let mut matches = rows.collect::<Result<Vec<_>, _>>().map_err(sqlite_err)?;
+    if matches.is_empty() {
+        return Err(AppError::with_details(
+            ErrorCode::NotFound,
+            format!("no project matched '{trimmed}'"),
+            serde_json::json!({ "project": trimmed }),
+        ));
+    }
+    if matches.len() > 1 {
+        return Err(AppError::with_details(
+            ErrorCode::Ambiguous,
+            format!("multiple projects matched '{trimmed}'"),
+            serde_json::json!({ "candidates": matches }),
+        ));
+    }
+    Ok(Some(matches.remove(0)))
 }
 
 fn read_payload(file: &mut File, event: &IndexedEvent) -> Result<Value, AppError> {
