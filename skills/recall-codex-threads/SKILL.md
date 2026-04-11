@@ -1,7 +1,7 @@
 ---
 name: recall-codex-threads
 description: >-
-  Search, resolve, and read past Codex conversation threads from local
+  List, search, resolve, and read past Codex conversation threads from local
   ~/.codex/sessions/ and ~/.codex/archived_sessions/ archives via the
   `codex-threads` CLI. Use whenever you want to find an earlier Codex session
   by topic, recover decisions made in prior threads, or mine successful past
@@ -40,11 +40,18 @@ without loading raw transcripts into context.
   `4` index missing, `5` not found, `6` ambiguous, `7` sync failed.
 - **Default scope excludes subagents.** Search results are always filtered to
   `default_scope = 1`, which hides threads whose `session_meta.source` is a
-  subagent spawn (e.g. `subagent:...`) or a non-string object source. Read
-  commands (`threads read`, `messages read`, `events read`) work on any
+  subagent spawn (e.g. `subagent:...`) or a non-string object source. List
+  commands (`threads list`, `messages list`) use the same default scope.
+  Read commands (`threads read`, `messages read`, `events read`) work on any
   indexed thread regardless of scope, as long as you already know the id.
-- **Lazy auto-sync.** Read commands sync the index automatically when stale.
-  Explicit `sync` is only needed before measuring `index stats`.
+- **Lazy auto-sync.** Read, search, and list commands sync the index
+  automatically when stale. Explicit `sync` is only needed before measuring
+  `index stats`.
+- **Chronological listing is first-class.** `threads list` orders by
+  `started_at` with `updated_at` fallback and stable `thread_id` tiebreaks.
+  `messages list` orders by `timestamp`, then `thread_id`, then message
+  ordinal, and supports `--role user|assistant` for first/last message
+  queries inside a derived project.
 - **Concurrency-safe reads.** If another `codex-threads` process holds the
   SQLite write lock, read commands fall back to the existing index instead
   of failing.
@@ -60,8 +67,8 @@ Usage: codex-threads [OPTIONS] <COMMAND>
 Commands:
   sync      Refresh the local derived index from Codex archives
   projects  List indexed projects
-  threads   Search, resolve, and read normalized threads
-  messages  Search and read normalized messages
+  threads   List, search, resolve, and read normalized threads
+  messages  List, search, and read normalized messages
   events    Read normalized event streams for a thread
   index     Inspect index statistics
   debug     Show resolved archive and index paths
@@ -80,10 +87,12 @@ Options:
 Examples:
   codex-threads --json sync
   codex-threads --json projects list
+  codex-threads --json threads list --project /Users/me/Projects/sweatshop --order asc --limit 1
   codex-threads --json threads search "build a CLI" --limit 20
   codex-threads --json threads search "refactor index" --project /Users/me/Projects/sweatshop
   codex-threads --json threads resolve "tweet idea"
   codex-threads --json threads read <thread-id>
+  codex-threads --json messages list --project /Users/me/Projects/sweatshop --role user --order asc --limit 1
   codex-threads --json messages search "archive format" --project /Users/me/Projects/sweatshop
   codex-threads --json events read <thread-id> --limit 50
 ```
@@ -93,9 +102,11 @@ Shorthand of the most useful invocations:
 ```text
 codex-threads --json sync [--rebuild]
 codex-threads --json projects list [--limit 50]
+codex-threads --json threads list [--project <slug-or-cwd>] [--order asc|desc] [--limit 20]
 codex-threads --json threads search <query> [--project <slug-or-cwd>] [--limit 20]
 codex-threads --json threads resolve <query>
 codex-threads --json threads read <thread-id>
+codex-threads --json messages list [--project <slug-or-cwd>] [--role user|assistant] [--order asc|desc] [--limit 20]
 codex-threads --json messages search <query> [--project <slug-or-cwd>] [--limit 20]
 codex-threads --json messages read <message-id>
 codex-threads --json events read <thread-id> [--limit 50]
@@ -116,6 +127,18 @@ List recent projects, then narrow a search to one workspace:
 ```bash
 codex-threads --json projects list
 codex-threads --json threads search "retry policy" --project /Users/me/Projects/sweatshop
+```
+
+Find the first user message in one derived project:
+
+```bash
+codex-threads --json messages list --project /Users/me/Projects/sweatshop --role user --order asc --limit 1
+```
+
+List threads in one project oldest-first:
+
+```bash
+codex-threads --json threads list --project /Users/me/Projects/sweatshop --order asc --limit 20
 ```
 
 Read the full normalized record for one thread:
@@ -164,6 +187,9 @@ codex-threads --json messages search "sandbox policy" --limit 20 | jq -r '.data.
 
 # Search only within one derived project
 codex-threads --json threads search "rework plan" --project /Users/me/Projects/sweatshop | jq '.data.items[] | {thread_id, project_slug}'
+
+# Get the earliest user message in one derived project
+codex-threads --json messages list --project /Users/me/Projects/sweatshop --role user --order asc --limit 1 | jq '.data.items[0] | {message_id, thread_id, text}'
 
 # Get the title, source_kind, and cwd for a thread you already know
 codex-threads --json threads read <thread-id> | jq '.data.thread | {title, source_kind, cwd}'

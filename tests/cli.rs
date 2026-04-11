@@ -9,6 +9,9 @@ use tempfile::TempDir;
 const THREAD_ONE: &str = "11111111-1111-4111-8111-111111111111";
 const THREAD_TWO: &str = "22222222-2222-4222-8222-222222222222";
 const SUBAGENT_THREAD: &str = "33333333-3333-4333-8333-333333333333";
+const THREAD_EARLY: &str = "12121212-1212-4121-8121-121212121212";
+const THREAD_LATE: &str = "13131313-1313-4131-8131-131313131313";
+const THREAD_UNTIMESTAMPED: &str = "14141414-1414-4141-8141-141414141414";
 
 const PROJECT_CODEX_CWD: &str = "/workspace/codex-threads";
 const PROJECT_ARCHIVE_CWD: &str = "/workspace/archive";
@@ -73,6 +76,35 @@ fn append_session_index(temp: &TempDir, line: &str) {
     writeln!(file, "{line}").expect("append session index");
 }
 
+fn add_same_project_ordering_threads(temp: &TempDir) {
+    write_session(
+        temp,
+        "sessions/2026/04/11/rollout-2026-04-11T09-00-00-12121212-1212-4121-8121-121212121212.jsonl",
+        "{\"timestamp\":\"2026-04-11T09:00:00Z\",\"type\":\"session_meta\",\"payload\":{\"id\":\"12121212-1212-4121-8121-121212121212\",\"timestamp\":\"2026-04-11T09:00:00Z\",\"cwd\":\"/workspace/codex-threads\",\"cli_version\":\"0.120.0\",\"source\":\"cli\"}}\n{\"timestamp\":\"2026-04-11T09:00:01Z\",\"type\":\"turn_context\",\"payload\":{\"turn_id\":\"turn-early\",\"cwd\":\"/workspace/codex-threads\",\"model\":\"gpt-5.4\",\"summary\":\"earliest\"}}\n{\"timestamp\":\"2026-04-11T09:00:02Z\",\"type\":\"event_msg\",\"payload\":{\"type\":\"user_message\",\"turn_id\":\"turn-early\",\"message\":\"first project question from the codex workspace\",\"images\":[],\"local_images\":[],\"text_elements\":[]}}\n{\"timestamp\":\"2026-04-11T09:00:03Z\",\"type\":\"response_item\",\"payload\":{\"type\":\"message\",\"role\":\"assistant\",\"content\":[{\"type\":\"output_text\",\"text\":\"Earliest reply for the codex workspace.\"}]}}\n",
+    );
+    write_session(
+        temp,
+        "sessions/2026/04/11/rollout-2026-04-11T12-30-00-13131313-1313-4131-8131-131313131313.jsonl",
+        "{\"timestamp\":\"2026-04-11T12:30:00Z\",\"type\":\"session_meta\",\"payload\":{\"id\":\"13131313-1313-4131-8131-131313131313\",\"timestamp\":\"2026-04-11T12:30:00Z\",\"cwd\":\"/workspace/codex-threads\",\"cli_version\":\"0.120.0\",\"source\":\"cli\"}}\n{\"timestamp\":\"2026-04-11T12:30:01Z\",\"type\":\"turn_context\",\"payload\":{\"turn_id\":\"turn-late\",\"cwd\":\"/workspace/codex-threads\",\"model\":\"gpt-5.4\",\"summary\":\"latest\"}}\n{\"timestamp\":\"2026-04-11T12:30:02Z\",\"type\":\"event_msg\",\"payload\":{\"type\":\"user_message\",\"turn_id\":\"turn-late\",\"message\":\"last project question from the codex workspace\",\"images\":[],\"local_images\":[],\"text_elements\":[]}}\n{\"timestamp\":\"2026-04-11T12:30:03Z\",\"type\":\"response_item\",\"payload\":{\"type\":\"message\",\"role\":\"assistant\",\"content\":[{\"type\":\"output_text\",\"text\":\"Latest reply for the codex workspace.\"}]}}\n",
+    );
+    append_session_index(
+        temp,
+        "{\"id\":\"12121212-1212-4121-8121-121212121212\",\"thread_name\":\"Earliest codex thread\",\"updated_at\":\"2026-04-11T09:00:04Z\"}",
+    );
+    append_session_index(
+        temp,
+        "{\"id\":\"13131313-1313-4131-8131-131313131313\",\"thread_name\":\"Latest codex thread\",\"updated_at\":\"2026-04-11T12:30:04Z\"}",
+    );
+}
+
+fn add_same_project_untimestamped_thread(temp: &TempDir) {
+    write_session(
+        temp,
+        "sessions/2026/04/11/rollout-2026-04-11T13-30-00-14141414-1414-4141-8141-141414141414.jsonl",
+        "{\"type\":\"session_meta\",\"payload\":{\"id\":\"14141414-1414-4141-8141-141414141414\",\"cwd\":\"/workspace/codex-threads\",\"cli_version\":\"0.120.0\",\"source\":\"cli\"}}\n{\"type\":\"turn_context\",\"payload\":{\"turn_id\":\"turn-untimed\",\"cwd\":\"/workspace/codex-threads\",\"model\":\"gpt-5.4\",\"summary\":\"untimestamped\"}}\n{\"type\":\"event_msg\",\"payload\":{\"type\":\"user_message\",\"turn_id\":\"turn-untimed\",\"message\":\"untimestamped project question from the codex workspace\",\"images\":[],\"local_images\":[],\"text_elements\":[]}}\n{\"type\":\"response_item\",\"payload\":{\"type\":\"message\",\"role\":\"assistant\",\"content\":[{\"type\":\"output_text\",\"text\":\"Untimestamped reply for the codex workspace.\"}]}}\n",
+    );
+}
+
 #[test]
 fn sync_indexes_fixture_archives() {
     let temp = copied_fixture_home();
@@ -99,6 +131,194 @@ fn projects_list_returns_known_projects_in_recency_order() {
     assert_eq!(items[2]["project_slug"], PROJECT_ARCHIVE_SLUG);
     assert_eq!(items[2]["project_cwd"], PROJECT_ARCHIVE_CWD);
     assert_eq!(items[2]["thread_count"], 1);
+}
+
+#[test]
+fn threads_list_project_filter_orders_chronologically() {
+    let temp = copied_fixture_home();
+    add_same_project_ordering_threads(&temp);
+    add_same_project_untimestamped_thread(&temp);
+    let _ = run_json(&temp, &["--json", "sync"]);
+
+    let (status, json, _stderr) = run_json(
+        &temp,
+        &[
+            "--json",
+            "threads",
+            "list",
+            "--project",
+            PROJECT_CODEX_SLUG,
+            "--order",
+            "asc",
+            "--limit",
+            "10",
+        ],
+    );
+    assert_eq!(status, 0);
+    assert_eq!(json["data"]["order"], "asc");
+    let items = json["data"]["items"].as_array().expect("items array");
+    let thread_ids = items
+        .iter()
+        .map(|item| item["thread_id"].as_str().expect("thread id"))
+        .collect::<Vec<_>>();
+    assert_eq!(
+        thread_ids,
+        vec![THREAD_EARLY, THREAD_ONE, THREAD_LATE, THREAD_UNTIMESTAMPED]
+    );
+
+    let (status, json, _stderr) = run_json(
+        &temp,
+        &[
+            "--json",
+            "threads",
+            "list",
+            "--project",
+            PROJECT_CODEX_SLUG,
+            "--order",
+            "desc",
+            "--limit",
+            "10",
+        ],
+    );
+    assert_eq!(status, 0);
+    assert_eq!(json["data"]["order"], "desc");
+    let items = json["data"]["items"].as_array().expect("items array");
+    let thread_ids = items
+        .iter()
+        .map(|item| item["thread_id"].as_str().expect("thread id"))
+        .collect::<Vec<_>>();
+    assert_eq!(
+        thread_ids,
+        vec![THREAD_LATE, THREAD_ONE, THREAD_EARLY, THREAD_UNTIMESTAMPED]
+    );
+    assert!(
+        items
+            .iter()
+            .all(|item| item["thread_id"] != SUBAGENT_THREAD && item["default_scope"] == true)
+    );
+}
+
+#[test]
+fn messages_list_project_filter_supports_first_and_last_user_queries() {
+    let temp = copied_fixture_home();
+    add_same_project_ordering_threads(&temp);
+    add_same_project_untimestamped_thread(&temp);
+    let _ = run_json(&temp, &["--json", "sync"]);
+
+    let (status, json, _stderr) = run_json(
+        &temp,
+        &[
+            "--json",
+            "messages",
+            "list",
+            "--project",
+            PROJECT_CODEX_CWD,
+            "--role",
+            "user",
+            "--order",
+            "asc",
+            "--limit",
+            "1",
+        ],
+    );
+    assert_eq!(status, 0);
+    assert_eq!(json["data"]["order"], "asc");
+    assert_eq!(json["data"]["role"], "user");
+    let items = json["data"]["items"].as_array().expect("items array");
+    assert_eq!(items.len(), 1);
+    assert_eq!(items[0]["thread_id"], THREAD_EARLY);
+    assert_eq!(
+        items[0]["text"],
+        "first project question from the codex workspace"
+    );
+
+    let (status, json, _stderr) = run_json(
+        &temp,
+        &[
+            "--json",
+            "messages",
+            "list",
+            "--project",
+            PROJECT_CODEX_CWD,
+            "--role",
+            "user",
+            "--order",
+            "desc",
+            "--limit",
+            "1",
+        ],
+    );
+    assert_eq!(status, 0);
+    assert_eq!(json["data"]["order"], "desc");
+    let items = json["data"]["items"].as_array().expect("items array");
+    assert_eq!(items.len(), 1);
+    assert_eq!(items[0]["thread_id"], THREAD_LATE);
+    assert_eq!(
+        items[0]["text"],
+        "last project question from the codex workspace"
+    );
+
+    let (status, json, _stderr) = run_json(
+        &temp,
+        &[
+            "--json",
+            "messages",
+            "list",
+            "--project",
+            PROJECT_CODEX_CWD,
+            "--role",
+            "user",
+            "--order",
+            "asc",
+            "--limit",
+            "10",
+        ],
+    );
+    assert_eq!(status, 0);
+    let items = json["data"]["items"].as_array().expect("items array");
+    let thread_ids = items
+        .iter()
+        .map(|item| item["thread_id"].as_str().expect("thread id"))
+        .collect::<Vec<_>>();
+    assert_eq!(
+        thread_ids,
+        vec![THREAD_EARLY, THREAD_ONE, THREAD_LATE, THREAD_UNTIMESTAMPED]
+    );
+}
+
+#[test]
+fn messages_list_excludes_subagent_messages_and_accepts_slug_filters() {
+    let temp = copied_fixture_home();
+    add_same_project_ordering_threads(&temp);
+    let _ = run_json(&temp, &["--json", "sync"]);
+
+    let (status, json, _stderr) = run_json(
+        &temp,
+        &[
+            "--json",
+            "messages",
+            "list",
+            "--project",
+            PROJECT_CODEX_SLUG,
+            "--order",
+            "asc",
+            "--limit",
+            "20",
+        ],
+    );
+    assert_eq!(status, 0);
+    let items = json["data"]["items"].as_array().expect("items array");
+    assert!(!items.is_empty());
+    assert!(
+        items
+            .iter()
+            .all(|item| item["project_slug"] == PROJECT_CODEX_SLUG)
+    );
+    assert!(
+        items
+            .iter()
+            .all(|item| item["thread_id"] != SUBAGENT_THREAD)
+    );
 }
 
 #[test]

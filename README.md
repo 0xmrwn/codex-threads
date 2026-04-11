@@ -64,10 +64,12 @@ either without the other.
 ```bash
 codex-threads --json sync
 codex-threads --json projects list
+codex-threads --json threads list --project /Users/me/Projects/sweatshop --order asc --limit 1
 codex-threads --json threads search "build a CLI" --limit 20
 codex-threads --json threads search "refactor index" --project /Users/me/Projects/sweatshop
 codex-threads --json threads resolve "tweet idea"
 codex-threads --json threads read <thread-id>
+codex-threads --json messages list --project /Users/me/Projects/sweatshop --role user --order asc --limit 1
 codex-threads --json messages search "archive format" --project /Users/me/Projects/sweatshop --limit 20
 codex-threads --json messages read <message-id>
 codex-threads --json events read <thread-id> --limit 50
@@ -84,6 +86,7 @@ codex-threads --json debug paths
 - Project identity is derived from per-session `cwd` values. Unlike `claude-threads`, Codex archives are date-based, so there is no path-native `projects/{slug}/` tree to inspect
 - Derived `project_slug` values use a collision-free escaped encoding of `cwd`, so `--project` is usually easiest to use with the full workspace path shown in `projects list`
 - `threads search` and `messages search` accept `--project`, which matches exact project slug, exact `cwd`, or a unique substring of either
+- `threads list` and `messages list` provide chronological ordering with `--order asc|desc`; `messages list` also supports `--role user|assistant` for questions like "what was my first message in this project?"
 
 ## Output Contract
 
