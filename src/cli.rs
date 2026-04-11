@@ -12,7 +12,7 @@ use serde_json::json;
     version,
     about = "Query local Codex conversation archives with stable JSON.",
     long_about = "Query, search, resolve, and read local Codex thread archives with deterministic JSON, predictable errors, and agent-friendly subcommands.",
-    after_help = "Examples:\n  codex-threads --json sync\n  codex-threads --json threads search \"build a CLI\" --limit 20\n  codex-threads --json threads resolve \"tweet idea\"\n  codex-threads --json threads read <thread-id>\n  codex-threads --json events read <thread-id> --limit 50"
+    after_help = "Examples:\n  codex-threads --json sync\n  codex-threads --json projects list\n  codex-threads --json threads search \"build a CLI\" --limit 20\n  codex-threads --json threads search \"refactor index\" --project /Users/me/Projects/sweatshop\n  codex-threads --json threads resolve \"tweet idea\"\n  codex-threads --json threads read <thread-id>\n  codex-threads --json messages search \"archive format\" --project /Users/me/Projects/sweatshop\n  codex-threads --json events read <thread-id> --limit 50"
 )]
 pub struct Cli {
     #[arg(long, global = true, action = ArgAction::SetTrue, help = "Emit machine-readable JSON to stdout")]
@@ -26,6 +26,9 @@ pub struct Cli {
 enum Command {
     #[command(about = "Refresh the local derived index from Codex archives")]
     Sync(SyncArgs),
+    #[command(subcommand)]
+    #[command(about = "List indexed projects")]
+    Projects(ProjectCommand),
     #[command(subcommand)]
     #[command(about = "Search, resolve, and read normalized threads")]
     Threads(ThreadCommand),
@@ -43,6 +46,12 @@ enum Command {
     Debug(DebugCommand),
 }
 
+#[derive(Debug, Subcommand)]
+enum ProjectCommand {
+    #[command(about = "List indexed projects, most recently active first")]
+    List(ListProjectsArgs),
+}
+
 #[derive(Debug, Args)]
 struct SyncArgs {
     #[arg(long, action = ArgAction::SetTrue, help = "Rebuild the derived index from scratch")]
@@ -52,7 +61,7 @@ struct SyncArgs {
 #[derive(Debug, Subcommand)]
 enum ThreadCommand {
     #[command(about = "Search normalized top-level threads")]
-    Search(SearchArgs),
+    Search(ThreadSearchArgs),
     #[command(about = "Resolve a fuzzy thread reference to one exact thread id")]
     Resolve(ResolveArgs),
     #[command(about = "Read one exact thread by stable thread id")]
@@ -62,7 +71,7 @@ enum ThreadCommand {
 #[derive(Debug, Subcommand)]
 enum MessageCommand {
     #[command(about = "Search normalized top-level messages")]
-    Search(SearchArgs),
+    Search(MessageSearchArgs),
     #[command(about = "Read one exact message by stable message id")]
     Read(ReadMessageArgs),
 }
@@ -86,7 +95,17 @@ enum DebugCommand {
 }
 
 #[derive(Debug, Args)]
-struct SearchArgs {
+struct ListProjectsArgs {
+    #[arg(
+        long,
+        default_value_t = 50,
+        help = "Maximum number of projects to return"
+    )]
+    limit: usize,
+}
+
+#[derive(Debug, Args)]
+struct ThreadSearchArgs {
     #[arg(help = "Search query")]
     query: String,
     #[arg(
@@ -95,6 +114,30 @@ struct SearchArgs {
         help = "Maximum number of results to return"
     )]
     limit: usize,
+    #[arg(
+        long,
+        allow_hyphen_values = true,
+        help = "Filter by project slug, full cwd, or substring (matches one project)"
+    )]
+    project: Option<String>,
+}
+
+#[derive(Debug, Args)]
+struct MessageSearchArgs {
+    #[arg(help = "Search query")]
+    query: String,
+    #[arg(
+        long,
+        default_value_t = 20,
+        help = "Maximum number of results to return"
+    )]
+    limit: usize,
+    #[arg(
+        long,
+        allow_hyphen_values = true,
+        help = "Filter by project slug, full cwd, or substring (matches one project)"
+    )]
+    project: Option<String>,
 }
 
 #[derive(Debug, Args)]
@@ -160,15 +203,37 @@ fn dispatch(cli: Cli, paths: &ResolvedPaths) -> Result<i32, (String, AppError, O
                 Err(error) => Err((command.to_string(), error, None)),
             }
         }
-        Command::Threads(command) => match command {
-            ThreadCommand::Search(args) => {
-                let command = "threads search";
-                match index::search_threads(paths, &args.query, args.limit) {
+        Command::Projects(command) => match command {
+            ProjectCommand::List(args) => {
+                let command = "projects list";
+                match index::list_projects(paths, args.limit) {
                     Ok((items, auto_sync)) => {
                         emit_success(
                             command,
                             cli.json,
                             json!({ "items": items, "limit": args.limit }),
+                            Some(auto_sync),
+                        );
+                        Ok(0)
+                    }
+                    Err(error) => Err((command.to_string(), error, None)),
+                }
+            }
+        },
+        Command::Threads(command) => match command {
+            ThreadCommand::Search(args) => {
+                let command = "threads search";
+                match index::search_threads(paths, &args.query, args.limit, args.project.as_deref())
+                {
+                    Ok((items, auto_sync)) => {
+                        emit_success(
+                            command,
+                            cli.json,
+                            json!({
+                                "items": items,
+                                "limit": args.limit,
+                                "project": args.project,
+                            }),
                             Some(auto_sync),
                         );
                         Ok(0)
@@ -210,12 +275,21 @@ fn dispatch(cli: Cli, paths: &ResolvedPaths) -> Result<i32, (String, AppError, O
         Command::Messages(command) => match command {
             MessageCommand::Search(args) => {
                 let command = "messages search";
-                match index::search_messages(paths, &args.query, args.limit) {
+                match index::search_messages(
+                    paths,
+                    &args.query,
+                    args.limit,
+                    args.project.as_deref(),
+                ) {
                     Ok((items, auto_sync)) => {
                         emit_success(
                             command,
                             cli.json,
-                            json!({ "items": items, "limit": args.limit }),
+                            json!({
+                                "items": items,
+                                "limit": args.limit,
+                                "project": args.project,
+                            }),
                             Some(auto_sync),
                         );
                         Ok(0)

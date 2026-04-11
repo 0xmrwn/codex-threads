@@ -59,6 +59,7 @@ Usage: codex-threads [OPTIONS] <COMMAND>
 
 Commands:
   sync      Refresh the local derived index from Codex archives
+  projects  List indexed projects
   threads   Search, resolve, and read normalized threads
   messages  Search and read normalized messages
   events    Read normalized event streams for a thread
@@ -78,9 +79,12 @@ Options:
 
 Examples:
   codex-threads --json sync
+  codex-threads --json projects list
   codex-threads --json threads search "build a CLI" --limit 20
+  codex-threads --json threads search "refactor index" --project /Users/me/Projects/sweatshop
   codex-threads --json threads resolve "tweet idea"
   codex-threads --json threads read <thread-id>
+  codex-threads --json messages search "archive format" --project /Users/me/Projects/sweatshop
   codex-threads --json events read <thread-id> --limit 50
 ```
 
@@ -88,10 +92,11 @@ Shorthand of the most useful invocations:
 
 ```text
 codex-threads --json sync [--rebuild]
-codex-threads --json threads search <query> [--limit 20]
+codex-threads --json projects list [--limit 50]
+codex-threads --json threads search <query> [--project <slug-or-cwd>] [--limit 20]
 codex-threads --json threads resolve <query>
 codex-threads --json threads read <thread-id>
-codex-threads --json messages search <query> [--limit 20]
+codex-threads --json messages search <query> [--project <slug-or-cwd>] [--limit 20]
 codex-threads --json messages read <message-id>
 codex-threads --json events read <thread-id> [--limit 50]
 codex-threads --json index stats
@@ -104,6 +109,13 @@ Find a past thread by topic:
 
 ```bash
 codex-threads --json threads search "build a CLI"
+```
+
+List recent projects, then narrow a search to one workspace:
+
+```bash
+codex-threads --json projects list
+codex-threads --json threads search "retry policy" --project /Users/me/Projects/sweatshop
 ```
 
 Read the full normalized record for one thread:
@@ -150,6 +162,9 @@ codex-threads --json threads search "rework plan" --limit 1 | jq -r '.data.items
 # Get all message ids that match a phrase
 codex-threads --json messages search "sandbox policy" --limit 20 | jq -r '.data.items[].message_id'
 
+# Search only within one derived project
+codex-threads --json threads search "rework plan" --project /Users/me/Projects/sweatshop | jq '.data.items[] | {thread_id, project_slug}'
+
 # Get the title, source_kind, and cwd for a thread you already know
 codex-threads --json threads read <thread-id> | jq '.data.thread | {title, source_kind, cwd}'
 ```
@@ -165,6 +180,16 @@ codex-threads --json threads read <thread-id> | jq '.data.thread | {title, sourc
   The indexer prefers `thread_name` from that file; if a session has no
   matching row, it falls back to a snippet of the first user message, and
   finally to the session UUID itself.
+- **Projects are derived from `cwd`, not archive paths.** Codex stores
+  sessions under date-based `sessions/` and `archived_sessions/` trees, so
+  `codex-threads` derives `project_cwd` from `session_meta.payload.cwd`
+  (falling back to the first primary `turn_context.payload.cwd`) and turns it
+  into a stable, collision-free `project_slug` using an escaped encoding of
+  the normalized `cwd`.
+- **Project filters resolve like Claude's.** `--project` accepts an exact
+  `project_slug`, an exact `project_cwd`, or a unique substring of either.
+  Zero matches return `not_found`; multiple matches return `ambiguous` with
+  candidate slugs.
 - **Subagent threads are classified, not dropped.** A JSONL file whose
   `session_meta.source` is a subagent object (e.g. `{"subagent": "..."}`)
   gets `default_scope = 0` and `source_kind = "subagent:<kind>"`. Search

@@ -2,12 +2,20 @@ use assert_cmd::Command;
 use rusqlite::Connection;
 use serde_json::Value;
 use std::fs;
+use std::io::Write;
 use std::path::{Path, PathBuf};
 use tempfile::TempDir;
 
 const THREAD_ONE: &str = "11111111-1111-4111-8111-111111111111";
 const THREAD_TWO: &str = "22222222-2222-4222-8222-222222222222";
 const SUBAGENT_THREAD: &str = "33333333-3333-4333-8333-333333333333";
+
+const PROJECT_CODEX_CWD: &str = "/workspace/codex-threads";
+const PROJECT_ARCHIVE_CWD: &str = "/workspace/archive";
+
+const PROJECT_CODEX_SLUG: &str = "~2Fworkspace~2Fcodex~2Dthreads";
+const PROJECT_IDEAS_SLUG: &str = "~2Fworkspace~2Fideas";
+const PROJECT_ARCHIVE_SLUG: &str = "~2Fworkspace~2Farchive";
 
 fn fixture_root() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/codex-home")
@@ -48,6 +56,23 @@ fn run_json(temp: &TempDir, args: &[&str]) -> (i32, Value, String) {
     (status, value, stderr)
 }
 
+fn write_session(temp: &TempDir, relative_path: &str, contents: &str) {
+    let path = temp.path().join(relative_path);
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent).expect("create session parent");
+    }
+    fs::write(path, contents).expect("write session");
+}
+
+fn append_session_index(temp: &TempDir, line: &str) {
+    let path = temp.path().join("session_index.jsonl");
+    let mut file = fs::OpenOptions::new()
+        .append(true)
+        .open(path)
+        .expect("open session index");
+    writeln!(file, "{line}").expect("append session index");
+}
+
 #[test]
 fn sync_indexes_fixture_archives() {
     let temp = copied_fixture_home();
@@ -55,9 +80,25 @@ fn sync_indexes_fixture_archives() {
     assert_eq!(status, 0);
     assert_eq!(json["ok"], true);
     assert_eq!(json["data"]["discovered_files"], 4);
+    assert_eq!(json["data"]["project_count"], 3);
     assert_eq!(json["data"]["thread_count"], 4);
     assert_eq!(json["data"]["message_count"], 9);
     assert_eq!(json["data"]["event_count"], 17);
+}
+
+#[test]
+fn projects_list_returns_known_projects_in_recency_order() {
+    let temp = copied_fixture_home();
+    let _ = run_json(&temp, &["--json", "sync"]);
+    let (status, json, _stderr) = run_json(&temp, &["--json", "projects", "list"]);
+    assert_eq!(status, 0);
+    let items = json["data"]["items"].as_array().expect("items array");
+    assert_eq!(items.len(), 3);
+    assert_eq!(items[0]["project_slug"], PROJECT_IDEAS_SLUG);
+    assert_eq!(items[1]["project_slug"], PROJECT_CODEX_SLUG);
+    assert_eq!(items[2]["project_slug"], PROJECT_ARCHIVE_SLUG);
+    assert_eq!(items[2]["project_cwd"], PROJECT_ARCHIVE_CWD);
+    assert_eq!(items[2]["thread_count"], 1);
 }
 
 #[test]
@@ -80,6 +121,92 @@ fn threads_search_lazy_sync_filters_out_subagents() {
     let items = json["data"]["items"].as_array().expect("items array");
     assert_eq!(items.len(), 1);
     assert_eq!(items[0]["thread_id"], THREAD_ONE);
+    assert_eq!(items[0]["project_slug"], PROJECT_CODEX_SLUG);
+}
+
+#[test]
+fn threads_search_project_filter_accepts_slug_and_full_cwd() {
+    let temp = copied_fixture_home();
+    let _ = run_json(&temp, &["--json", "sync"]);
+
+    let (status, json, _stderr) = run_json(
+        &temp,
+        &[
+            "--json",
+            "threads",
+            "search",
+            "tweet idea",
+            "--project",
+            PROJECT_IDEAS_SLUG,
+            "--limit",
+            "10",
+        ],
+    );
+    assert_eq!(status, 0);
+    let items = json["data"]["items"].as_array().expect("items array");
+    assert_eq!(items.len(), 1);
+    assert_eq!(items[0]["thread_id"], THREAD_TWO);
+
+    let (status, json, _stderr) = run_json(
+        &temp,
+        &[
+            "--json",
+            "threads",
+            "search",
+            "build a CLI",
+            "--project",
+            PROJECT_CODEX_CWD,
+            "--limit",
+            "10",
+        ],
+    );
+    assert_eq!(status, 0);
+    let items = json["data"]["items"].as_array().expect("items array");
+    assert_eq!(items.len(), 1);
+    assert_eq!(items[0]["thread_id"], THREAD_ONE);
+}
+
+#[test]
+fn threads_search_project_filter_reports_ambiguous_and_unknown_queries() {
+    let temp = copied_fixture_home();
+    let _ = run_json(&temp, &["--json", "sync"]);
+
+    let (status, json, _stderr) = run_json(
+        &temp,
+        &[
+            "--json",
+            "threads",
+            "search",
+            "tweet idea",
+            "--project",
+            "workspace",
+            "--limit",
+            "10",
+        ],
+    );
+    assert_eq!(status, 6);
+    let candidates = json["error"]["details"]["candidates"]
+        .as_array()
+        .expect("candidate array");
+    assert_eq!(candidates[0], PROJECT_ARCHIVE_SLUG);
+    assert_eq!(candidates[1], PROJECT_CODEX_SLUG);
+    assert_eq!(candidates[2], PROJECT_IDEAS_SLUG);
+
+    let (status, json, _stderr) = run_json(
+        &temp,
+        &[
+            "--json",
+            "threads",
+            "search",
+            "tweet idea",
+            "--project",
+            "does-not-exist",
+            "--limit",
+            "10",
+        ],
+    );
+    assert_eq!(status, 5);
+    assert_eq!(json["error"]["code"], "not_found");
 }
 
 #[test]
@@ -113,6 +240,9 @@ fn threads_read_returns_exact_thread() {
     assert_eq!(json["data"]["thread"]["thread_id"], THREAD_ONE);
     assert_eq!(json["data"]["thread"]["title"], "Design codex-threads CLI");
     assert_eq!(json["data"]["thread"]["has_subagents"], true);
+    assert_eq!(json["data"]["thread"]["project_slug"], PROJECT_CODEX_SLUG);
+    assert_eq!(json["data"]["thread"]["project_cwd"], PROJECT_CODEX_CWD);
+    assert_eq!(json["data"]["thread"]["cwd"], PROJECT_CODEX_CWD);
 }
 
 #[test]
@@ -139,12 +269,62 @@ fn messages_search_and_read_return_normalized_messages() {
         run_json(&temp, &["--json", "messages", "read", message_id]);
     assert_eq!(read_status, 0);
     assert_eq!(read_json["data"]["message"]["role"], "assistant");
+    assert_eq!(
+        read_json["data"]["message"]["project_slug"],
+        PROJECT_CODEX_SLUG
+    );
     assert!(
         read_json["data"]["message"]["text"]
             .as_str()
             .expect("message text")
             .contains("inspect the archive format")
     );
+}
+
+#[test]
+fn messages_search_project_filter_excludes_other_projects() {
+    let temp = copied_fixture_home();
+    let _ = run_json(&temp, &["--json", "sync"]);
+
+    let (status, json, _stderr) = run_json(
+        &temp,
+        &[
+            "--json",
+            "messages",
+            "search",
+            "tweet",
+            "--project",
+            PROJECT_IDEAS_SLUG,
+            "--limit",
+            "10",
+        ],
+    );
+    assert_eq!(status, 0);
+    let items = json["data"]["items"].as_array().expect("items array");
+    assert!(!items.is_empty());
+    assert!(
+        items
+            .iter()
+            .all(|item| item["thread_id"] == THREAD_TWO
+                && item["project_slug"] == PROJECT_IDEAS_SLUG)
+    );
+
+    let (status, json, _stderr) = run_json(
+        &temp,
+        &[
+            "--json",
+            "messages",
+            "search",
+            "tweet",
+            "--project",
+            PROJECT_CODEX_SLUG,
+            "--limit",
+            "10",
+        ],
+    );
+    assert_eq!(status, 0);
+    let items = json["data"]["items"].as_array().expect("items array");
+    assert!(items.is_empty());
 }
 
 #[test]
@@ -168,6 +348,7 @@ fn index_stats_and_debug_paths_are_available() {
     let (stats_status, stats_json, _stderr) = run_json(&temp, &["--json", "index", "stats"]);
     assert_eq!(stats_status, 0);
     assert_eq!(stats_json["meta"]["auto_sync_performed"], false);
+    assert_eq!(stats_json["data"]["project_count"], 3);
     assert_eq!(stats_json["data"]["thread_count"], 4);
 
     let (debug_status, debug_json, _stderr) = run_json(&temp, &["--json", "debug", "paths"]);
@@ -293,6 +474,155 @@ fn explicit_sync_then_search_is_not_stale() {
     let items = json["data"]["items"].as_array().expect("items array");
     assert_eq!(items.len(), 2);
     assert!(items.iter().any(|item| item["thread_id"] == THREAD_TWO));
+}
+
+#[test]
+fn session_meta_missing_cwd_falls_back_to_turn_context_project() {
+    let temp = copied_fixture_home();
+    let thread_id = "55555555-5555-4555-8555-555555555555";
+    write_session(
+        &temp,
+        "sessions/2026/04/11/rollout-2026-04-11T13-00-00-55555555-5555-4555-8555-555555555555.jsonl",
+        "{\"timestamp\":\"2026-04-11T13:00:00Z\",\"type\":\"session_meta\",\"payload\":{\"id\":\"55555555-5555-4555-8555-555555555555\",\"timestamp\":\"2026-04-11T13:00:00Z\",\"cli_version\":\"0.120.0\",\"source\":\"cli\"}}\n{\"timestamp\":\"2026-04-11T13:00:01Z\",\"type\":\"turn_context\",\"payload\":{\"turn_id\":\"turn-5\",\"cwd\":\"/workspace/fallback-project\",\"model\":\"gpt-5.4\",\"summary\":\"fallback\"}}\n{\"timestamp\":\"2026-04-11T13:00:02Z\",\"type\":\"event_msg\",\"payload\":{\"type\":\"user_message\",\"turn_id\":\"turn-5\",\"message\":\"fallback project search term\",\"images\":[],\"local_images\":[],\"text_elements\":[]}}\n",
+    );
+    append_session_index(
+        &temp,
+        "{\"id\":\"55555555-5555-4555-8555-555555555555\",\"thread_name\":\"Fallback cwd thread\",\"updated_at\":\"2026-04-11T13:00:03Z\"}",
+    );
+
+    let (status, json, _stderr) = run_json(&temp, &["--json", "threads", "read", thread_id]);
+    assert_eq!(status, 0);
+    let thread = &json["data"]["thread"];
+    assert_eq!(thread["project_slug"], "~2Fworkspace~2Ffallback~2Dproject");
+    assert_eq!(thread["project_cwd"], "/workspace/fallback-project");
+    assert_eq!(thread["cwd"], "/workspace/fallback-project");
+
+    let (status, json, _stderr) = run_json(&temp, &["--json", "projects", "list"]);
+    assert_eq!(status, 0);
+    let items = json["data"]["items"].as_array().expect("items array");
+    assert!(
+        items
+            .iter()
+            .any(|item| item["project_slug"] == "~2Fworkspace~2Ffallback~2Dproject")
+    );
+}
+
+#[test]
+fn session_without_any_cwd_stays_searchable_but_absent_from_projects() {
+    let temp = copied_fixture_home();
+    let thread_id = "66666666-6666-4666-8666-666666666666";
+    write_session(
+        &temp,
+        "sessions/2026/04/11/rollout-2026-04-11T14-00-00-66666666-6666-4666-8666-666666666666.jsonl",
+        "{\"timestamp\":\"2026-04-11T14:00:00Z\",\"type\":\"session_meta\",\"payload\":{\"id\":\"66666666-6666-4666-8666-666666666666\",\"timestamp\":\"2026-04-11T14:00:00Z\",\"cli_version\":\"0.120.0\",\"source\":\"cli\"}}\n{\"timestamp\":\"2026-04-11T14:00:01Z\",\"type\":\"turn_context\",\"payload\":{\"turn_id\":\"turn-6\",\"model\":\"gpt-5.4\",\"summary\":\"no cwd\"}}\n{\"timestamp\":\"2026-04-11T14:00:02Z\",\"type\":\"event_msg\",\"payload\":{\"type\":\"user_message\",\"turn_id\":\"turn-6\",\"message\":\"no cwd special search term\",\"images\":[],\"local_images\":[],\"text_elements\":[]}}\n",
+    );
+
+    let (status, json, _stderr) = run_json(
+        &temp,
+        &[
+            "--json",
+            "threads",
+            "search",
+            "no cwd special search term",
+            "--limit",
+            "10",
+        ],
+    );
+    assert_eq!(status, 0);
+    let items = json["data"]["items"].as_array().expect("items array");
+    assert_eq!(items.len(), 1);
+    assert_eq!(items[0]["thread_id"], thread_id);
+    assert!(items[0]["project_slug"].is_null());
+
+    let (status, json, _stderr) = run_json(&temp, &["--json", "threads", "read", thread_id]);
+    assert_eq!(status, 0);
+    let thread = &json["data"]["thread"];
+    assert!(thread["project_slug"].is_null());
+    assert!(thread["project_cwd"].is_null());
+    assert!(thread["cwd"].is_null());
+
+    let (status, json, _stderr) = run_json(&temp, &["--json", "projects", "list"]);
+    assert_eq!(status, 0);
+    let items = json["data"]["items"].as_array().expect("items array");
+    assert_eq!(items.len(), 3);
+}
+
+#[test]
+fn distinct_cwds_with_separator_vs_hyphen_get_distinct_project_slugs() {
+    let temp = copied_fixture_home();
+
+    write_session(
+        &temp,
+        "sessions/2026/04/11/rollout-2026-04-11T15-00-00-77777777-7777-4777-8777-777777777777.jsonl",
+        "{\"timestamp\":\"2026-04-11T15:00:00Z\",\"type\":\"session_meta\",\"payload\":{\"id\":\"77777777-7777-4777-8777-777777777777\",\"timestamp\":\"2026-04-11T15:00:00Z\",\"cwd\":\"/workspace/foo-bar\",\"cli_version\":\"0.120.0\",\"source\":\"cli\"}}\n{\"timestamp\":\"2026-04-11T15:00:01Z\",\"type\":\"event_msg\",\"payload\":{\"type\":\"user_message\",\"turn_id\":\"turn-7\",\"message\":\"slug collision alpha\",\"images\":[],\"local_images\":[],\"text_elements\":[]}}\n",
+    );
+    write_session(
+        &temp,
+        "sessions/2026/04/11/rollout-2026-04-11T16-00-00-88888888-8888-4888-8888-888888888888.jsonl",
+        "{\"timestamp\":\"2026-04-11T16:00:00Z\",\"type\":\"session_meta\",\"payload\":{\"id\":\"88888888-8888-4888-8888-888888888888\",\"timestamp\":\"2026-04-11T16:00:00Z\",\"cwd\":\"/workspace/foo/bar\",\"cli_version\":\"0.120.0\",\"source\":\"cli\"}}\n{\"timestamp\":\"2026-04-11T16:00:01Z\",\"type\":\"event_msg\",\"payload\":{\"type\":\"user_message\",\"turn_id\":\"turn-8\",\"message\":\"slug collision beta\",\"images\":[],\"local_images\":[],\"text_elements\":[]}}\n",
+    );
+
+    let (status, json, _stderr) = run_json(&temp, &["--json", "projects", "list"]);
+    assert_eq!(status, 0);
+    let items = json["data"]["items"].as_array().expect("items array");
+    assert!(
+        items
+            .iter()
+            .any(|item| item["project_slug"] == "~2Fworkspace~2Ffoo~2Dbar")
+    );
+    assert!(
+        items
+            .iter()
+            .any(|item| item["project_slug"] == "~2Fworkspace~2Ffoo~2Fbar")
+    );
+
+    let (status, json, _stderr) = run_json(
+        &temp,
+        &[
+            "--json",
+            "threads",
+            "search",
+            "slug collision",
+            "--project",
+            "~2Fworkspace~2Ffoo~2Dbar",
+            "--limit",
+            "10",
+        ],
+    );
+    assert_eq!(status, 0);
+    let items = json["data"]["items"].as_array().expect("items array");
+    assert_eq!(items.len(), 1);
+    assert_eq!(
+        items[0]["thread_id"],
+        "77777777-7777-4777-8777-777777777777"
+    );
+}
+
+#[test]
+fn schema_version_mismatch_triggers_auto_rebuild() {
+    let temp = copied_fixture_home();
+    let _ = run_json(&temp, &["--json", "sync"]);
+
+    let index_path = temp.path().join("codex-threads/index.sqlite");
+    let conn = Connection::open(index_path).expect("open sqlite");
+    conn.execute("DELETE FROM state WHERE key = 'schema_version'", [])
+        .expect("delete schema version");
+
+    let (status, json, _stderr) = run_json(
+        &temp,
+        &[
+            "--json",
+            "threads",
+            "search",
+            "build a CLI",
+            "--limit",
+            "10",
+        ],
+    );
+    assert_eq!(status, 0);
+    assert_eq!(json["meta"]["auto_sync_performed"], true);
+    let items = json["data"]["items"].as_array().expect("items array");
+    assert_eq!(items[0]["thread_id"], THREAD_ONE);
 }
 
 #[test]
