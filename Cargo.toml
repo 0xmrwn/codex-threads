@@ -1,6 +1,6 @@
 [package]
 name = "codex-threads"
-version = "0.1.1"
+version = "0.1.2"
 edition = "2024"
 license = "MIT"
 description = "Query, search, resolve, and read local Codex session archives with deterministic JSON, predictable errors, and agent-friendly subcommands."

@@ -67,6 +67,15 @@ fn write_session(temp: &TempDir, relative_path: &str, contents: &str) {
     fs::write(path, contents).expect("write session");
 }
 
+fn write_session_jsonl(temp: &TempDir, relative_path: &str, records: &[Value]) {
+    let contents = records
+        .iter()
+        .map(Value::to_string)
+        .collect::<Vec<_>>()
+        .join("\n");
+    write_session(temp, relative_path, &format!("{contents}\n"));
+}
+
 fn append_session_index(temp: &TempDir, line: &str) {
     let path = temp.path().join("session_index.jsonl");
     let mut file = fs::OpenOptions::new()
@@ -116,6 +125,158 @@ fn sync_indexes_fixture_archives() {
     assert_eq!(json["data"]["thread_count"], 4);
     assert_eq!(json["data"]["message_count"], 9);
     assert_eq!(json["data"]["event_count"], 17);
+}
+
+#[test]
+fn current_rollout_schema_indexes_user_turns_and_top_level_events() {
+    let temp = copied_fixture_home();
+    let thread_id = "99999999-9999-4999-8999-999999999998";
+    write_session_jsonl(
+        &temp,
+        "sessions/2026/09/29/rollout-2026-09-29T10-00-00-99999999-9999-4999-8999-999999999998.jsonl",
+        &[
+            serde_json::json!({"timestamp":"2026-09-29T10:00:00Z","type":"session_meta","payload":{"id":thread_id,"timestamp":"2026-09-29T10:00:00Z","cwd":"/workspace/current","source":"exec","thread_source":"user"}}),
+            serde_json::json!({"timestamp":"2026-09-29T10:00:01Z","type":"event_msg","payload":{"type":"task_started","turn_id":"turn-current"}}),
+            serde_json::json!({"timestamp":"2026-09-29T10:00:02Z","type":"response_item","payload":{"type":"message","role":"developer","content":[{"type":"input_text","text":"private instruction marker"}]}}),
+            serde_json::json!({"timestamp":"2026-09-29T10:00:03Z","type":"response_item","payload":{"type":"message","role":"user","content":[{"type":"input_text","text":"current schema unique phrase"},{"type":"input_image","image_url":"data:image/png;base64,AAAA"},{"type":"input_text","text":"second part"}]}}),
+            serde_json::json!({"timestamp":"2026-09-29T10:00:04Z","type":"event_msg","payload":{"type":"user_message","message":"current schema unique phrase\nsecond part"}}),
+            serde_json::json!({"timestamp":"2026-09-29T10:00:05Z","type":"world_state","full":true,"state":{"status":"ready"}}),
+            serde_json::json!({"timestamp":"2026-09-29T10:00:06Z","type":"turn_context","payload":{"turn_id":"turn-current","cwd":"/workspace/current"}}),
+            serde_json::json!({"timestamp":"2026-09-29T10:00:07Z","type":"response_item","payload":{"type":"message","role":"assistant","content":[{"type":"output_text","text":"Current reply."}]}}),
+            serde_json::json!({"timestamp":"2026-09-29T10:00:08Z","type":"token_usage_record","thread_id":thread_id,"usage":{"input_tokens":2}}),
+        ],
+    );
+
+    let (status, thread_json, _stderr) = run_json(&temp, &["--json", "threads", "read", thread_id]);
+    assert_eq!(status, 0);
+    assert_eq!(thread_json["data"]["thread"]["message_count"], 2);
+    assert_eq!(
+        thread_json["data"]["thread"]["title"],
+        "current schema unique phrase second part"
+    );
+
+    let (status, messages_json, _stderr) = run_json(
+        &temp,
+        &[
+            "--json",
+            "messages",
+            "list",
+            "--project",
+            "/workspace/current",
+            "--role",
+            "user",
+        ],
+    );
+    assert_eq!(status, 0);
+    let messages = messages_json["data"]["items"].as_array().expect("messages");
+    assert_eq!(messages.len(), 1);
+    assert_eq!(
+        messages[0]["text"],
+        "current schema unique phrase\nsecond part"
+    );
+    assert_eq!(messages[0]["kind"], "user_message");
+
+    let (status, search_json, _stderr) = run_json(
+        &temp,
+        &["--json", "messages", "search", "schema unique phrase"],
+    );
+    assert_eq!(status, 0);
+    assert_eq!(search_json["data"]["items"][0]["thread_id"], thread_id);
+
+    let (status, events_json, _stderr) = run_json(
+        &temp,
+        &["--json", "events", "read", thread_id, "--limit", "20"],
+    );
+    assert_eq!(status, 0);
+    let events = events_json["data"]["items"].as_array().expect("events");
+    assert_eq!(events.len(), 9);
+    let world_state = events
+        .iter()
+        .find(|event| event["record_type"] == "world_state")
+        .expect("world state event");
+    assert_eq!(world_state["payload"]["state"]["status"], "ready");
+    let usage = events
+        .iter()
+        .find(|event| event["record_type"] == "token_usage_record")
+        .expect("usage event");
+    assert_eq!(usage["payload"]["usage"]["input_tokens"], 2);
+}
+
+#[test]
+fn current_subagent_source_stays_out_of_default_search() {
+    let temp = copied_fixture_home();
+    let thread_id = "99999999-9999-4999-8999-999999999997";
+    write_session_jsonl(
+        &temp,
+        "sessions/2026/09/29/rollout-2026-09-29T11-00-00-99999999-9999-4999-8999-999999999997.jsonl",
+        &[
+            serde_json::json!({"timestamp":"2026-09-29T11:00:00Z","type":"session_meta","payload":{"id":thread_id,"cwd":"/workspace/current","source":{"subagent":{"thread_spawn":{"parent_thread_id":THREAD_ONE,"depth":1}}},"thread_source":"subagent"}}),
+            serde_json::json!({"timestamp":"2026-09-29T11:00:01Z","type":"response_item","payload":{"type":"message","role":"user","content":[{"type":"input_text","text":"nested subagent unique phrase"}]}}),
+        ],
+    );
+
+    let (status, thread_json, _stderr) = run_json(&temp, &["--json", "threads", "read", thread_id]);
+    assert_eq!(status, 0);
+    assert_eq!(
+        thread_json["data"]["thread"]["source_kind"],
+        "subagent:thread_spawn"
+    );
+    assert_eq!(thread_json["data"]["thread"]["default_scope"], false);
+
+    let (status, search_json, _stderr) = run_json(
+        &temp,
+        &[
+            "--json",
+            "threads",
+            "search",
+            "nested subagent unique phrase",
+        ],
+    );
+    assert_eq!(status, 0);
+    assert!(
+        search_json["data"]["items"]
+            .as_array()
+            .expect("items")
+            .is_empty()
+    );
+}
+
+#[test]
+fn thread_source_fallback_hides_known_subagents_and_keeps_feature_threads() {
+    let temp = copied_fixture_home();
+    let feature_id = "99999999-9999-4999-8999-999999999996";
+    let subagent_id = "99999999-9999-4999-8999-999999999995";
+    write_session_jsonl(
+        &temp,
+        "sessions/2026/09/29/rollout-2026-09-29T12-00-00-99999999-9999-4999-8999-999999999996.jsonl",
+        &[
+            serde_json::json!({"type":"session_meta","payload":{"id":feature_id,"cwd":"/workspace/current","thread_source":"feature:import"}}),
+            serde_json::json!({"type":"response_item","payload":{"type":"message","role":"user","content":[{"type":"input_text","text":"feature source query marker"}]}}),
+        ],
+    );
+    write_session_jsonl(
+        &temp,
+        "sessions/2026/09/29/rollout-2026-09-29T12-01-00-99999999-9999-4999-8999-999999999995.jsonl",
+        &[
+            serde_json::json!({"type":"session_meta","payload":{"id":subagent_id,"cwd":"/workspace/current","thread_source":"subagent"}}),
+            serde_json::json!({"type":"response_item","payload":{"type":"message","role":"user","content":[{"type":"input_text","text":"fallback subagent query marker"}]}}),
+        ],
+    );
+
+    let (status, search_json, _stderr) = run_json(
+        &temp,
+        &["--json", "threads", "search", "source query marker"],
+    );
+    assert_eq!(status, 0);
+    let hits = search_json["data"]["items"].as_array().expect("hits");
+    assert_eq!(hits.len(), 1);
+    assert_eq!(hits[0]["thread_id"], feature_id);
+
+    let (status, thread_json, _stderr) =
+        run_json(&temp, &["--json", "threads", "read", subagent_id]);
+    assert_eq!(status, 0);
+    assert_eq!(thread_json["data"]["thread"]["default_scope"], false);
+    assert_eq!(thread_json["data"]["thread"]["has_subagents"], true);
 }
 
 #[test]
@@ -825,8 +986,11 @@ fn schema_version_mismatch_triggers_auto_rebuild() {
 
     let index_path = temp.path().join("codex-threads/index.sqlite");
     let conn = Connection::open(index_path).expect("open sqlite");
-    conn.execute("DELETE FROM state WHERE key = 'schema_version'", [])
-        .expect("delete schema version");
+    conn.execute(
+        "UPDATE state SET value = '2' WHERE key = 'schema_version'",
+        [],
+    )
+    .expect("set previous schema version");
 
     let (status, json, _stderr) = run_json(
         &temp,

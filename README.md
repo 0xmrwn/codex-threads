@@ -87,6 +87,9 @@ codex-threads --json debug paths
 - Derived `project_slug` values use a collision-free escaped encoding of `cwd`, so `--project` is usually easiest to use with the full workspace path shown in `projects list`
 - `threads search` and `messages search` accept `--project`, which matches exact project slug, exact `cwd`, or a unique substring of either
 - `threads list` and `messages list` provide chronological ordering with `--order asc|desc`; `messages list` also supports `--role user|assistant` for questions like "what was my first message in this project?"
+- User messages are read from both older `event_msg.user_message` records and current `response_item` messages with `role: "user"`; adjacent duplicate records are indexed once
+- `events read` exposes data from current top-level records such as `world_state` and `token_usage_record` through the existing `payload` field
+- Existing derived indexes rebuild automatically when the parser version changes
 
 ## Output Contract
 
