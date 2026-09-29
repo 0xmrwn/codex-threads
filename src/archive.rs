@@ -232,7 +232,13 @@ pub fn parse_thread(
                     .and_then(Value::as_str)
                 {
                     source_kind = thread_source.to_string();
-                    default_scope = thread_source == "user";
+                    default_scope = !matches!(
+                        thread_source,
+                        "subagent" | "guardian_review" | "memory_consolidation"
+                    );
+                    if !default_scope {
+                        has_subagents = true;
+                    }
                 }
             } else {
                 has_subagents = true;

@@ -242,6 +242,44 @@ fn current_subagent_source_stays_out_of_default_search() {
 }
 
 #[test]
+fn thread_source_fallback_hides_known_subagents_and_keeps_feature_threads() {
+    let temp = copied_fixture_home();
+    let feature_id = "99999999-9999-4999-8999-999999999996";
+    let subagent_id = "99999999-9999-4999-8999-999999999995";
+    write_session_jsonl(
+        &temp,
+        "sessions/2026/09/29/rollout-2026-09-29T12-00-00-99999999-9999-4999-8999-999999999996.jsonl",
+        &[
+            serde_json::json!({"type":"session_meta","payload":{"id":feature_id,"cwd":"/workspace/current","thread_source":"feature:import"}}),
+            serde_json::json!({"type":"response_item","payload":{"type":"message","role":"user","content":[{"type":"input_text","text":"feature source query marker"}]}}),
+        ],
+    );
+    write_session_jsonl(
+        &temp,
+        "sessions/2026/09/29/rollout-2026-09-29T12-01-00-99999999-9999-4999-8999-999999999995.jsonl",
+        &[
+            serde_json::json!({"type":"session_meta","payload":{"id":subagent_id,"cwd":"/workspace/current","thread_source":"subagent"}}),
+            serde_json::json!({"type":"response_item","payload":{"type":"message","role":"user","content":[{"type":"input_text","text":"fallback subagent query marker"}]}}),
+        ],
+    );
+
+    let (status, search_json, _stderr) = run_json(
+        &temp,
+        &["--json", "threads", "search", "source query marker"],
+    );
+    assert_eq!(status, 0);
+    let hits = search_json["data"]["items"].as_array().expect("hits");
+    assert_eq!(hits.len(), 1);
+    assert_eq!(hits[0]["thread_id"], feature_id);
+
+    let (status, thread_json, _stderr) =
+        run_json(&temp, &["--json", "threads", "read", subagent_id]);
+    assert_eq!(status, 0);
+    assert_eq!(thread_json["data"]["thread"]["default_scope"], false);
+    assert_eq!(thread_json["data"]["thread"]["has_subagents"], true);
+}
+
+#[test]
 fn projects_list_returns_known_projects_in_recency_order() {
     let temp = copied_fixture_home();
     let _ = run_json(&temp, &["--json", "sync"]);
