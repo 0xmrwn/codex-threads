@@ -147,6 +147,7 @@ pub fn parse_thread(
     let mut derived_title: Option<String> = None;
     let mut foreign_session_meta_seen = false;
     let mut tail_block_started = false;
+    let mut preceding_response_user_text: Option<String> = None;
 
     loop {
         line.clear();
@@ -226,6 +227,12 @@ pub fn parse_thread(
                     if !is_default_scope {
                         has_subagents = true;
                     }
+                } else if let Some(thread_source) = payload
+                    .and_then(|item| item.get("thread_source"))
+                    .and_then(Value::as_str)
+                {
+                    source_kind = thread_source.to_string();
+                    default_scope = thread_source == "user";
                 }
             } else {
                 has_subagents = true;
@@ -268,14 +275,27 @@ pub fn parse_thread(
             }
         }
 
-        if let Some(message) = extract_message(
-            &value,
+        let extracted_message = extract_message(
             &record_type,
             payload,
             timestamp.clone(),
             &file.thread_id,
             message_ordinal + 1,
-        ) {
+        );
+        let duplicate_user_event = record_type == "event_msg"
+            && payload_type.as_deref() == Some("user_message")
+            && extracted_message.as_ref().is_some_and(|message| {
+                preceding_response_user_text.as_deref() == Some(message.text.as_str())
+            });
+        preceding_response_user_text = if record_type == "response_item" {
+            extracted_message
+                .as_ref()
+                .filter(|message| message.role == "user")
+                .map(|message| message.text.clone())
+        } else {
+            None
+        };
+        if let Some(message) = extracted_message.filter(|_| !duplicate_user_event) {
             if derived_title.is_none() && message.role == "user" {
                 derived_title = Some(snippet_from_text(&message.text, 72));
             }
@@ -476,13 +496,22 @@ fn starts_new_turn_block(record_type: &str, payload: Option<&Value>) -> bool {
 
 fn classify_source(value: &Value) -> (String, bool) {
     if let Some(source) = value.as_str() {
-        return (source.to_string(), true);
+        return (
+            source.to_string(),
+            !source.starts_with("subagent_") && !source.starts_with("internal_"),
+        );
     }
     if let Some(subagent) = value.get("subagent") {
         if let Some(kind) = subagent.as_str() {
             return (format!("subagent:{kind}"), false);
         }
+        if let Some(kind) = subagent.as_object().and_then(|object| object.keys().next()) {
+            return (format!("subagent:{kind}"), false);
+        }
         return ("subagent".to_string(), false);
+    }
+    if value.get("internal").is_some() {
+        return ("internal".to_string(), false);
     }
     ("object".to_string(), false)
 }
@@ -529,7 +558,6 @@ fn hex_digit(value: u8) -> char {
 }
 
 fn extract_message(
-    value: &Value,
     record_type: &str,
     payload: Option<&Value>,
     timestamp: Option<String>,
@@ -596,7 +624,8 @@ fn extract_message(
             if payload.get("type").and_then(Value::as_str) != Some("message") {
                 return None;
             }
-            if payload.get("role").and_then(Value::as_str) != Some("assistant") {
+            let role = payload.get("role").and_then(Value::as_str)?;
+            if role != "assistant" && role != "user" {
                 return None;
             }
             let text = extract_message_text(payload.get("content")?)?;
@@ -609,17 +638,19 @@ fn extract_message(
                 thread_id: thread_id.to_string(),
                 ordinal,
                 turn_id: None,
-                role: "assistant".to_string(),
-                kind: "assistant_message".to_string(),
+                role: role.to_string(),
+                kind: if role == "user" {
+                    "user_message"
+                } else {
+                    "assistant_message"
+                }
+                .to_string(),
                 timestamp,
                 snippet: snippet_from_text(&text, 140),
                 text,
             })
         }
-        _ => {
-            let _ = value;
-            None
-        }
+        _ => None,
     }
 }
 

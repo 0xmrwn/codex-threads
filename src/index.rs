@@ -11,7 +11,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::fs::File;
 use std::io::{Read, Seek, SeekFrom};
 
-const SCHEMA_VERSION: &str = "2";
+const SCHEMA_VERSION: &str = "3";
 
 #[derive(Debug, Serialize)]
 pub struct SyncSummary {
@@ -1297,10 +1297,13 @@ fn read_payload(file: &mut File, event: &IndexedEvent) -> Result<Value, AppError
         .map_err(|error| internal(format!("event bytes were not valid UTF-8: {error}")))?;
     let value: Value = serde_json::from_str(line.trim_end())
         .map_err(|error| internal(format!("failed to re-parse indexed event: {error}")))?;
-    Ok(value
-        .get("payload")
-        .cloned()
-        .unwrap_or_else(|| Value::Object(Default::default())))
+    if let Some(payload) = value.get("payload") {
+        return Ok(payload.clone());
+    }
+    let mut data = value.as_object().cloned().unwrap_or_default();
+    data.remove("timestamp");
+    data.remove("type");
+    Ok(Value::Object(data))
 }
 
 fn sqlite_err(error: rusqlite::Error) -> AppError {
