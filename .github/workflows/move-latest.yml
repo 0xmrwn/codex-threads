@@ -16,15 +16,10 @@ jobs:
           fetch-depth: 0
       - name: Move latest tag to released commit
         env:
-          TARGET: ${{ github.event.release.target_commitish }}
+          RELEASE_TAG: ${{ github.event.release.tag_name }}
         run: |
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-          # target_commitish is typically a branch name like "main" (not a SHA),
-          # and after checkout the local workspace has no such branch — only
-          # origin/main as a remote-tracking ref. Resolve it through origin/ first,
-          # and fall through to rev-parsing it directly in case it's already a SHA
-          # (which happens when the release is cut from a tag instead of a branch).
-          COMMIT=$(git rev-parse "origin/$TARGET" 2>/dev/null || git rev-parse "$TARGET")
+          COMMIT=$(git rev-parse --verify "refs/tags/$RELEASE_TAG^{commit}")
           git tag -f latest "$COMMIT"
           git push origin latest --force
