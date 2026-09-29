@@ -23,7 +23,7 @@ It is designed for repeated agent use against local `~/.codex` data, not as a ho
 Pinned to a specific version (reproducible across machines):
 
 ```bash
-cargo install --git https://github.com/0xmrwn/codex-threads --tag v0.1.0 --locked
+cargo install --git https://github.com/0xmrwn/codex-threads --tag v1.1.2 --locked
 ```
 
 Always-latest (re-run with `--force` to upgrade in place):
